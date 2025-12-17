@@ -1,0 +1,457 @@
+---
+title: "Pseudotime Analysis"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libs
+```{r}
+library(Seurat)
+# Immcantation
+library(alakazam)
+library(shazam)
+library(tigger)
+library(dplyr)
+library(data.table)
+library(scales)
+library(igraph)
+library(devtools)
+library(pheatmap)
+library(RColorBrewer)
+library(ape)
+library(stringr)
+# Dedrogram stuff
+library(stringdist)
+library(graphics)
+library(ggdendro)
+library(dendextend)
+
+library(ggpubr)
+library(gridExtra)
+
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+source("/Resources/functions_sc_analysis.R")
+
+plot_dir   <- "./plots_main/"
+dir.create(plot_dir,recursive = T)
+```
+
+
+# 1. Load TCR RNA-Seq Object
+```{r}
+load("./objects/tcell_igseq_obj_PAIRS.RData")
+
+# Subset CD4 and CD8
+pairs_cd4 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD4 T cells")])]
+pairs_cd8 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD8 T cells")])]
+```
+
+
+# 2. Load immcantation result All Samples & meta data
+```{r}
+# ALL Ig-seq samples
+db.tra <- readChangeoDb("./immcantation_results_v3.1/10X_alpha-parse-FILTERED_germ-pass.final.tab")
+db.trb <- readChangeoDb("./immcantation_results_v3.1/10X_beta_clone-pass-FILTERED_germ-pass.final.tab")
+
+# Alpha and Beta entries
+db.all <- rbind(db.tra,db.trb)
+
+# Formatted table - with cell type annotations
+mab_table <- read.csv("./tables/mAb_candidates/mab_table_ALL_TCR.v3.1.CLEAN.csv",stringsAsFactors = F)
+mab_table <- mab_table[mab_table$chain_count != 1,]
+```
+
+# 3. Add useful cloumns
+
+### a. add useful columns
+* loc,sample,diagnositc category
+```{r}
+# Make a sample and loc columns
+sample_col <- tstrsplit(db.all$SEQUENCE_ID,":")[[1]]
+db.all$SAMPLE <- sample_col
+
+# Make a Patient Column
+patient_col <- tstrsplit(db.all$SAMPLE,"_")[[1]]
+db.all$PATIENT <- patient_col
+
+# loc column
+loc_vec <- db.all$SEQUENCE_ID
+loc_vec[grep("CSF", loc_vec)] <- "CSF"
+loc_vec[loc_vec != "CSF"] <- "PB"
+db.all$LOC <- loc_vec
+
+# Ig-Seq Barcode
+igseq_barcode <- tstrsplit(db.all$SEQUENCE_ID,"-")[[1]]
+igseq_sample  <- tstrsplit(igseq_barcode,":")[[1]]
+igseq_cell    <- tstrsplit(igseq_barcode,":")[[2]]
+igseq_barcode <- paste(igseq_cell, igseq_sample)
+igseq_barcode <- str_replace_all(igseq_barcode,"\\ ","-")
+db.all$igseq_barcode <- igseq_barcode
+
+# Add V/D/J Family Usage columns
+db.all$V_CALL_GENE <- tstrsplit(db.all$V_CALL,"\\*")[[1]]
+db.all$V_CALL_FAM  <- tstrsplit(db.all$V_CALL_GENE,"-")[[1]]
+db.all$J_CALL_GENE <- tstrsplit(db.all$J_CALL,"\\*")[[1]]
+db.all$J_CALL_FAM  <- tstrsplit(db.all$J_CALL,"\\*")[[1]]
+db.all$D_CALL_GENE <- tstrsplit(db.all$D_CALL,"\\*")[[1]]
+db.all$D_CALL_FAM  <- tstrsplit(db.all$D_CALL_GENE,"-")[[1]]
+
+```
+
+
+### b. OMIT cells with 1 chain
+* lines up immcantation output with mAb table
+```{r}
+multi_chain_cells <- as.character(unique(mab_table$igseq_barcode))
+db.all <- db.all[db.all$igseq_barcode %in% multi_chain_cells,]
+```
+
+### c. remove cells if there is an NA at the LOCUS level (TRA or TRB)
+```{r}
+chains <- unique(db.all$LOCUS[!is.na(db.all$LOCUS)])
+db.all <- db.all[db.all$LOCUS %in% chains,]
+```
+
+### d. add merged clonotype IDs
+```{r}
+db.all$CLONE_ORIGINAL <- db.all$CLONE
+orig_clonotypes <- db.all$CLONE
+names(orig_clonotypes) <- db.all$igseq_barcode
+
+# merged clonotypes 
+merged_clonotypes <- as.character(mab_table$MERGED_clonotypeID_imm)
+names(merged_clonotypes) <- as.character(mab_table$igseq_barcode)
+
+new_clone_col <- orig_clonotypes
+
+for (cell in unique(names(orig_clonotypes))) {
+  combined_clonotype <- as.character(merged_clonotypes[cell])
+  new_clone_col[names(new_clone_col) %in% cell] <- combined_clonotype
+}
+
+db.all$CLONE <- new_clone_col
+```
+
+
+### e. add PaperID_Diagnosis_Loc column,Diagnosis,PaperID
+```{r}
+metadata_sheet = "./metadata/metadata.csv"
+metadata.df <- read.csv(metadata_sheet)
+metadata.df <- metadata.df[! metadata.df$TCR_Sample %in% c("","n/a"),]
+
+paper_conv_vec <- as.character(metadata.df$Paper_ID_Diagnosis_loc)
+names(paper_conv_vec) <- as.character(metadata.df$TCR_Sample)
+
+new_col <- db.all$SAMPLE
+
+for(s in as.character(unique(new_col))){
+  if (s %in% names(paper_conv_vec)){
+    new_col[new_col %in% s] <- as.character(paper_conv_vec[s])
+  } else{
+    new_col[new_col %in% s] <- ""
+  }
+}
+db.all$Paper_ID_Diagnosis_loc <- new_col
+
+## Diagnosis column
+db.all$Diagnosis <- tstrsplit(db.all$Paper_ID_Diagnosis_loc,"_")[[2]]
+```
+
+
+### f. Add CD4/CD8 annotation
+
+#### --simple CD4/CD8 Annotations
+```{r}
+mab_table_cd4 <- mab_table[mab_table$seurat_converted_cell_barcode %in% colnames(pairs_cd4),]
+mab_table_cd8 <- mab_table[mab_table$seurat_converted_cell_barcode %in% colnames(pairs_cd8),]
+
+new_annot_col<- rep("No Annot",length(db.all$igseq_barcode))
+names(new_annot_col) <- db.all$igseq_barcode
+new_annot_col[names(new_annot_col) %in% as.character(unique(mab_table_cd4$igseq_barcode))] <- "CD4 T cells"
+new_annot_col[names(new_annot_col) %in% as.character(unique(mab_table_cd8$igseq_barcode))] <- "CD8 T cells"
+
+db.all$tcell_simple_annot <- new_annot_col
+```
+
+
+### g. Add simple Diagnosis Column
+```{r}
+simple_diagnosis_vec <- db.all$Diagnosis
+# MS
+simple_diagnosis_vec[simple_diagnosis_vec %in% c("RRMS","CIS")] <- "MS"
+# OND
+simple_diagnosis_vec[simple_diagnosis_vec %in% c("Neurosarcoidosis","NMO","Uveitis")] <- "OND"
+
+db.all$Diagnosis_simple <- simple_diagnosis_vec
+
+```
+
+### g. subset MS, HC, OND
+```{r}
+db_ms   <- db.all[db.all$Diagnosis %in% c("RRMS","CIS"),]
+db_hc   <- db.all[db.all$Diagnosis %in% c("HC"),]
+db_ond  <- db.all[db.all$Diagnosis %in% c("Neurosarcoidosis","NMO","Uveitis"),] 
+```
+
+### h. subset PB and CSF
+```{r}
+# Everything
+db.all.csf <- db.all[db.all$LOC == "CSF",]
+db.all.pb  <- db.all[db.all$LOC == "PB",]
+
+# MS
+db_ms_csf <- db_ms[db_ms$LOC == "CSF",]
+db_ms_pb  <- db_ms[db_ms$LOC == "PB",]
+
+# HC
+db_hc_csf <- db_hc[db_hc$LOC == "CSF",]
+db_hc_pb  <- db_hc[db_hc$LOC == "PB",]
+
+# OND
+db_ond_csf <- db_ond[db_ond$LOC == "CSF",]
+db_ond_pb  <- db_ond[db_ond$LOC == "PB",]
+```
+
+
+# ----------------------------
+# DGE Per Cluster - TCR only
+
+# 1. Find All Markers
+```{r}
+set.seed(12345)
+
+levels(pairs_csfpb5_tcr) <- unique(pairs_csfpb5_tcr$seurat_clusters)
+
+top_genes_per_cluster <- FindAllMarkers(pairs_csfpb5_tcr,
+                                        logfc.threshold = 0.25,
+                                        test.use = "wilcox",
+                                        min.pct = 0.1,
+                                        max.cells.per.ident = Inf)
+
+```
+
+
+
+# ----------------------------
+
+# DGE - CSF high vs other expanded clones CSF
+
+# 1. load Clonotype counts
+```{r}
+clonotype_counts_fh <- "./tables/patient_clonotype_pcts/ALL_PATIENTS_clonotype_counts.csv"
+
+clonotype_counts <- read.csv(clonotype_counts_fh,row.names = 1)
+
+# Add column of CSF expanded/Other
+HIGH_THRESH         = 0.75
+CSF_PB_RATIO_THRESH = 2
+
+csf_high <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH & clonotype_counts$CSF_PB_ratio > CSF_PB_RATIO_THRESH,]
+csf_high_clonotypes <- row.names(csf_high)
+
+exp_category <- row.names(clonotype_counts)
+exp_category[exp_category %in% csf_high_clonotypes]   <- "CSF_high_expanded"
+exp_category[! exp_category %in% "CSF_high_expanded"] <- "CSF_expanded"
+clonotype_counts$exp_category <- exp_category
+
+clonotype_counts <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH,]
+
+ggplot(clonotype_counts, aes(x=pct_PB, y=pct_CSF,color=exp_category)) + geom_point(aes(size=cell_count),alpha=0.25) + scale_color_manual(breaks = c("CSF_high_expanded", "CSF_expanded"),values=c("red", "black"))
+```
+
+# 2. DGE CSF unique high vs CSF high clonotypes
+
+### a. subset pairs_csfpb5_tcr
+```{r}
+clone_df_high <- clonotype_counts[clonotype_counts$exp_category %in% "CSF_high_expanded",]
+clone_df_exp  <- clonotype_counts[clonotype_counts$exp_category %in% "CSF_expanded",]
+
+target_clones  <- unique(row.names(clone_df_high))
+csf_exp_clones <- unique(row.names(clone_df_exp))
+pairs_csfpb5_tcr_sub <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$MERGED_clonotypeID_imm[pairs_csfpb5_tcr$MERGED_clonotypeID_imm %in% c(target_clones,csf_exp_clones)])]
+
+# Create column for annotations
+pairs_csfpb5_tcr_sub$CSF_high_annot <- pairs_csfpb5_tcr_sub$MERGED_clonotypeID_imm
+pairs_csfpb5_tcr_sub$CSF_high_annot[pairs_csfpb5_tcr_sub$CSF_high_annot %in% target_clones] <- "CSF_high"
+pairs_csfpb5_tcr_sub$CSF_high_annot[pairs_csfpb5_tcr_sub$CSF_high_annot %in% csf_exp_clones] <- "CSF_expanded"
+```
+
+### b. DGE
+```{r}
+Idents(pairs_csfpb5_tcr_sub) <- pairs_csfpb5_tcr_sub$CSF_high_annot
+dge_csf_high     <- FindAllMarkers(pairs_csfpb5_tcr_sub,logfc.threshold = 0.15)
+dge_csf_high_sig <- dge_csf_high[dge_csf_high$p_val_adj < 0.05,]
+
+# Heatmap
+TOP_N <- 20
+top_genes <- dge_csf_high_sig %>% group_by(cluster) %>% top_n(TOP_N, avg_logFC)
+DoHeatmap(object = pairs_csfpb5_tcr_sub,features = top_genes$gene, draw.lines = T,disp.min = -3,disp.max = 3)
+
+DotPlot(object = pairs_csfpb5_tcr_sub,features = unique(top_genes$gene)) + theme(axis.text.x = element_text(angle = 90, hjust=1)) + ggtitle("TCR CSF High vs. CSF Expanded") + coord_flip()
+```
+
+### c. target genes
+```{r}
+all_genes <- row.names(pairs_csfpb5_tcr_sub)
+
+naive_panel        <- c("SELL","CCR7","IL7R","KLF2","LEF1")
+eff_mem_panel      <- c("TBX21","EOMES","ZEB2","CX3CR1","KLRG1","CCL5","CD38","CD28","CD27","CD69","CD57","IL2RA")
+trafficking_panel <- c("ITA4","ITGB1","ITGAE","CXCR3","CXCR1","CCR5","CCR6")
+cytotoxicity_panel <- c("GZMA","GZMK","PRF1","CST7")
+regulation_panel   <- c("FOXP3","HOPX","CTLA4")
+exhaustion_panel   <- c("DHX37","TIGIT","DUSP2","PDCD1","TCF7","LAG3","HAVCR2","TOX")
+
+all_panels <- c(naive_panel,eff_mem_panel,trafficking_panel,cytotoxicity_panel,regulation_panel,exhaustion_panel)
+
+all_genes[grep("PAC",all_genes)]
+```
+
+
+```{r}
+createGeneStatsTable <- function(seurat_obj,genes_vec,type = "counts") {
+  all_stats <- as.data.frame(matrix(nrow = 0, ncol = 8))
+
+  for (gene in genes_vec) {
+    raw_mtx<- GetAssayData(object = seurat_obj, slot = type)
+    raw_df <- as.data.frame(raw_mtx[row.names(raw_mtx) %in% gene,])
+    names(raw_df) <- "Gene"
+    raw_df$annotation <- row.names(raw_df) 
+  
+    csf_high_cells <- seurat_obj$CSF_high_annot[seurat_obj$CSF_high_annot %in% "CSF_high"]
+    csf_exp_cells  <- seurat_obj$CSF_high_annot[seurat_obj$CSF_high_annot %in% "CSF_expanded"]
+    
+    if(nrow(raw_df) == 0){next}
+  
+    raw_df$annotation[raw_df$annotation %in% names(csf_high_cells)] <- "CSF_high"
+    raw_df$annotation[raw_df$annotation %in% names(csf_exp_cells)]  <- "CSF_expanded"
+    
+    gene_stats      <- compare_means(Gene ~ annotation, raw_df, method = "t.test",ref.group = "CSF_expanded")
+    
+    if (nrow(gene_stats) > 0){
+      gene_stats[1,1] <- gene
+      all_stats <- rbind(all_stats,gene_stats)
+    }
+  }
+  
+  return(all_stats)
+}
+
+# Create summary tables for Joe
+stats_raw_counts <- createGeneStatsTable(pairs_csfpb5_tcr_sub,genes_vec = all_panels,type = "counts")
+stats_sct_counts <- createGeneStatsTable(pairs_csfpb5_tcr_sub,genes_vec = all_panels,type = "scale.data")
+
+
+# Create count matrix for Joe
+createGeneMtx <- function(seurat_obj,genes_vec,type = "counts") {
+  gene_mtx <- as.data.frame(seurat_obj$CSF_high_annot)
+  names(gene_mtx) <- "CSF_high_annot"
+  
+  for (gene in genes_vec) {
+    raw_mtx<- GetAssayData(object = seurat_obj, slot = type)
+    raw_df <- as.data.frame(raw_mtx[row.names(raw_mtx) %in% gene,])
+    names(raw_df) <- gene
+    
+    if(nrow(raw_df) == 0 || ncol(raw_df) == 0){next}
+    
+    gene_mtx <- merge(gene_mtx,raw_df, by=0,all=TRUE)
+    row.names(gene_mtx) <- gene_mtx$Row.names
+    gene_mtx$Row.names <- NULL
+    
+  }
+  
+  return(gene_mtx)
+}
+
+input_raw_counts <- createGeneMtx(pairs_csfpb5_tcr_sub,genes_vec = all_panels,type = "counts")
+input_sct_counts <- createGeneMtx(pairs_csfpb5_tcr_sub,genes_vec = all_panels,type = "scale.data")
+```
+
+# ----------------------------
+
+# Trajectory of Shared CSF-PB clones
+
+# 1. Load clone counts
+```{r}
+clonotype_counts_fh <- "./tables/patient_clonotype_pcts/ALL_PATIENTS_clonotype_counts.csv"
+
+clonotype_counts <- read.csv(clonotype_counts_fh,row.names = 1)
+
+# Add column of CSF expanded/Other
+HIGH_THRESH         = 0.75
+CSF_PB_RATIO_THRESH = 2
+
+# CSF highly expanded
+csf_high <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH & clonotype_counts$CSF_PB_ratio > CSF_PB_RATIO_THRESH,]
+csf_high_clonotypes <- row.names(csf_high)
+
+# CSF expanded
+csf_exp <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH,]
+csf_exp <- csf_exp[! row.names(csf_exp) %in% csf_high_clonotypes,]
+csf_exp_clones <- row.names(csf_exp)
+
+# CSF-PB shared clones
+csfpb_shared <- clonotype_counts[clonotype_counts$CSF_count > 0 & clonotype_counts$PB_count > 0,]
+csfpb_shared_clones <- row.names(csfpb_shared)
+```
+
+# 2. Subset RNA-Seq object
+```{r}
+target_cells <- names(pairs_csfpb5_tcr$MERGED_clonotypeID_imm[pairs_csfpb5_tcr$MERGED_clonotypeID_imm %in% csfpb_shared_clones])
+pairs_csfpb5_tcr_shared <- pairs_csfpb5_tcr[,target_cells]
+
+# create column for shared 
+shared_csfpb_clone_status <- pairs_csfpb5_tcr_shared$MERGED_clonotypeID_imm
+shared_csfpb_clone_status[shared_csfpb_clone_status %in% csf_high_clonotypes]           <- "CSF_high_exp"
+shared_csfpb_clone_status[shared_csfpb_clone_status %in% csf_exp_clones]                <- "CSF_exp"
+shared_csfpb_clone_status[! shared_csfpb_clone_status %in% c("CSF_high_exp","CSF_exp")] <- "CSFPB_shared"
+pairs_csfpb5_tcr_shared$shared_csfpb_clone_status <- shared_csfpb_clone_status
+
+# Create object with just shared CSF expanded clones
+targets_cells2 <- names(pairs_csfpb5_tcr_shared$shared_csfpb_clone_status[! pairs_csfpb5_tcr_shared$shared_csfpb_clone_status %in% "CSFPB_shared"])
+pairs_csfpb5_tcr_shared_exp <- pairs_csfpb5_tcr_shared[,targets_cells2]
+```
+
+# 3. Load into Monocle
+```{r}
+shared_clones_obj <- run_monocle_v3(pairs_csfpb5_tcr_shared)
+shared_exp_clones_obj <- run_monocle_v3(pairs_csfpb5_tcr_shared_exp)
+
+# meta data columns
+metadata_columns <- names(colData(shared_clones_obj))
+```
+
+# 4. Plots - Pseudo time
+
+### a. All shared clones - Loc
+```{r,fig.width=7,fig.height=6}
+pdf(file = paste(plot_dir,"fig1_pseudotime_shared_clones_loc.pdf"),height = 6,width = 7)
+plot_cells(shared_clones_obj,color_cells_by = "loc",cell_size = 1.5,
+           label_branch_points = F,label_leaves = F,label_cell_groups=FALSE,
+           reduction_method = c("UMAP"),trajectory_graph_segment_size = 1.5,alpha = 0.3) + scale_color_manual(values=c('blue','red'))
+dev.off()
+```
+
+### b. CSF expanded shared clones - Loc
+```{r,fig.width=7,fig.height=6}
+pdf(file = paste(plot_dir,"fig1_pseudotime_CSFexp_shared_clones_loc.pdf"),height = 6,width = 7)
+plot_cells(shared_exp_clones_obj,color_cells_by = "loc",cell_size = 1.5,
+           label_branch_points = F,label_leaves = F,label_cell_groups=FALSE,
+           reduction_method = c("UMAP"),trajectory_graph_segment_size = 1.5,alpha = 0.3) + scale_color_manual(values=c('blue','red'))
+dev.off()
+```
+
+
+### c. CSF expanded shared clones - Clonotype
+```{r,fig.width=9,fig.height=6}
+pdf(file = paste(plot_dir,"fig1_pseudotime_CSFexp_shared_clones_clonotypeID.pdf"),height = 6,width = 9)
+plot_cells(shared_exp_clones_obj,color_cells_by = "MERGED_clonotypeID_imm",cell_size = 2.5,
+           label_branch_points = F,label_leaves = F,label_cell_groups=FALSE,
+           reduction_method = c("UMAP"),trajectory_graph_segment_size = 1.5,alpha = 0.3)
+dev.off()
+```
+
