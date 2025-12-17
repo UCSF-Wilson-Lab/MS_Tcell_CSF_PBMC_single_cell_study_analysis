@@ -1,0 +1,598 @@
+---
+title: "Main Figures RNA-Seq TCR"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libs
+```{r}
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+
+library(Seurat)
+library(reshape2)
+library(pheatmap)
+library(SingleR)
+library(kableExtra)
+library(devtools)
+library(dplyr)
+library(parallel)
+library(data.table)
+library(Matrix)
+# Volcano
+library(ggrepel)
+library(ggplot2)
+library(dittoSeq)
+# Grid Plots
+library(gridExtra)
+# Monocle 3
+library(RColorBrewer)
+
+# OUTPUT Directories
+plot_dir      <- "./plots_main/"
+supp_plot_dir <- "./plots_supp/PatientScatter/"
+dir.create(plot_dir,recursive = T)
+dir.create(supp_plot_dir,recursive = T)
+
+object_dir <- "./objects"
+
+source("Resources/functions_sc_analysis.R")
+```
+
+# 1. Load object
+```{r}
+load("./objects/tcell_obj_PAIRS.9PCs.CLEAN.RData")
+# TCR only
+load("./objects/tcell_igseq_obj_PAIRS.RData")
+```
+
+### a. Add Expansion Category
+#### --load Clonotype counts
+```{r}
+clonotype_counts_fh <- "./tables/patient_clonotype_pcts/ALL_PATIENTS_clonotype_counts.csv"
+
+clonotype_counts <- read.csv(clonotype_counts_fh,row.names = 1)
+
+# Add column of CSF expanded/Other
+HIGH_THRESH         = 0.75
+CSF_PB_RATIO_THRESH = 2
+
+csf_high <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH & clonotype_counts$CSF_PB_ratio > CSF_PB_RATIO_THRESH,]
+csf_high_clonotypes <- row.names(csf_high)
+
+exp_category <- row.names(clonotype_counts)
+exp_category[exp_category %in% csf_high_clonotypes]   <- "CSF_high_expanded"
+exp_category[! exp_category %in% "CSF_high_expanded"] <- "Other"
+clonotype_counts$exp_category <- exp_category
+```
+
+### b. Scatter PDF/TIFF
+* Re-generate and check if it loads into illustrator
+* Adjust transparency
+
+```{r}
+pdf(file = paste(plot_dir,"scatter_plot_pct_CSFvsPB_per_clone.pdf"))
+ggplot(clonotype_counts, aes(x=pct_PB, y=pct_CSF,color=exp_category)) + geom_point(aes(size=cell_count,alpha=0.6)) + scale_color_manual(breaks = c("CSF_high_expanded", "Other"),values=c("red", "black"))
+dev.off()
+
+tiff(file = paste(plot_dir,"scatter_plot_pct_CSFvsPB_per_clone.tiff"),width = 7,height=7, units="in", res=300)
+ggplot(clonotype_counts, aes(x=pct_PB, y=pct_CSF,color=exp_category)) + geom_point(aes(size=cell_count)) + scale_color_manual(breaks = c("CSF_high_expanded", "Other"),values=c("red", "black"))
+dev.off()
+
+```
+
+
+### c. Create Expansion Category column
+```{r}
+clone_categ_vec <- pairs_csfpb5_tcr$MERGED_clonotypeID_imm
+
+# Define Highly expanded clones
+HIGH_THRESH = 0.75
+high_exp        <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH,]
+high_exp_clones <- unique(row.names(high_exp))
+nonexp          <- clonotype_counts[clonotype_counts$cell_count == 1,]
+nonexp_clones   <- unique(row.names(nonexp))
+
+clone_categ_vec[clone_categ_vec %in% high_exp_clones] <- "High"
+clone_categ_vec[clone_categ_vec %in% nonexp_clones]   <- "Non-expanded"
+clone_categ_vec[! clone_categ_vec %in% c("Non-expanded","High")] <- "Moderate" 
+
+pairs_csfpb5_tcr$clonotype_expansion_categ <- clone_categ_vec
+```
+
+### d. Add MS vs. Non-MS category
+```{r}
+diag_simple <- pairs_csfpb5_tcr$Diagnostic_Category
+diag_simple[diag_simple %in% c("HC", "OND")] <- "Non-MS"
+
+pairs_csfpb5_tcr$Diagnosis_Simple <- diag_simple
+```
+
+# 1.5 Per Patient Scatter (Supp)
+```{r}
+formatCloneCountMtx <- function(clonotype_counts_fh) {
+  clonotype_counts <- read.csv(clonotype_counts_fh,row.names = 1,stringsAsFactors = F)
+
+  # Add column of CSF expanded/Other
+  HIGH_THRESH         = 0.75
+  
+  CSF_PB_RATIO_THRESH = 2
+
+  csf_high <- clonotype_counts[clonotype_counts$CSF_PB_ratio > CSF_PB_RATIO_THRESH,]
+  csf_uni_high <- clonotype_counts[clonotype_counts$CSF_PB_ratio > CSF_PB_RATIO_THRESH & clonotype_counts$PB_count <= 1,]
+  csf_high_clonotypes <- row.names(csf_high)
+  csf_uni_high_clonotypes <- row.names(csf_uni_high)
+  
+  # Subdivide CSF high into two annotations
+  overlapping_clones      <-  csf_high_clonotypes[csf_high_clonotypes %in% csf_uni_high_clonotypes]
+  csf_high_clonotypes_rem <- csf_high_clonotypes[! csf_high_clonotypes %in% overlapping_clones]
+
+  exp_category <- row.names(clonotype_counts)
+  exp_category[exp_category %in% csf_high_clonotypes_rem]   <- "CSF_high"
+  exp_category[exp_category %in% overlapping_clones]        <- "CSF_unique_high"
+  exp_category[! exp_category %in% c("CSF_high","CSF_unique_high")]          <- "Peripheral"
+  clonotype_counts$exp_category <- exp_category
+  
+  return(clonotype_counts)
+}
+```
+
+
+```{r}
+clone_freq_dir <- "./tables/patient_clonotype_pcts/"
+fh_list <- list.files(clone_freq_dir,full.names = T)
+patient_list <- list.files(clone_freq_dir)
+patient_list <- tstrsplit(patient_list,"\\.")[[1]]
+names(fh_list) <- patient_list
+
+fh_list <- fh_list[! names(fh_list) %in% "ALL_PATIENTS_clonotype_counts"]
+
+# Formatted Data frame for clonotype counts
+col_names <- c("cell_count","CSF_count","PB_count","pct_total","pct_CSF","pct_PB","CSF_PB_ratio", "exp_category","patient")
+combined_clone_df <- data.frame(matrix(nrow = 0,ncol = length(col_names)))
+names(combined_clone_df) <- col_names
+
+plot_list <- list()
+for (pt in names(fh_list)) {
+  fh <- as.character(fh_list[pt])
+  pt_clone_counts <- formatCloneCountMtx(fh)
+  pt_clone_counts$patient <- pt
+  # Combine each formatted patient data frame
+  combined_clone_df <- rbind(combined_clone_df,pt_clone_counts)
+  
+  p <- ggplot(pt_clone_counts, aes(x=pct_PB, y=pct_CSF,color=exp_category)) + geom_point(aes(size=cell_count)) + scale_color_manual(breaks = c("CSF_unique_high","CSF_high","Peripheral"),values=c("red","blue","black")) + ggtitle(pt)
+  #p + scale_x_continuous(trans = 'log2') + scale_y_continuous(trans = 'log2')
+  
+  plot_list[[pt]] <- p
+}
+```
+
+
+## --WRITE CLONE DF CSV
+```{r}
+write.csv(combined_clone_df,file = "./tables/clone_freq_table_fmt.csv",quote = F)
+```
+
+# 2. UMAPs All Cells
+
+### a. Fig 1a - seurat clusters
+```{r}
+p <- dittoDimPlot(pairs_csfpb5_nov,var = "seurat_clusters",size = 0.3,opacity = 1.0,do.label = T,legend.show = F,main = NULL,do.raster = T,raster.dpi = 300)
+
+pdf(file = paste0(plot_dir,"fig1a_UMAP_PAIRS_seurat_clusters.pdf"),height = 7,width = 7)
+p
+dev.off()
+```
+
+### b. Fig 1a - manual annotations
+```{r}
+p <- dittoDimPlot(pairs_csfpb5_nov,var = "main.cell.annot.manual",size = 0.3,opacity = 1.0,do.label = T,labels.size = 3,legend.show = F,main = NULL,do.raster = T,raster.dpi = 300)
+
+pdf(file = paste0(plot_dir,"fig1a_UMAP_PAIRS_main_manual_annot.pdf"))
+p
+dev.off()
+
+```
+
+# 3. UMAPs TCR Only
+
+### --color schemes
+```{r}
+# loc 
+loc_cols = c("CSF" = "blue", "PB" = "red")
+annot_cols = c("CD8 T cells" = "steelblue3", "CD4 T cells" = "plum3")
+diagnosis_cols = c("MS" = "darkmagenta","Non-MS" = "darkorange3")
+```
+
+### a. Fig 1b - loc
+```{r}
+p <- dittoDimPlot(pairs_csfpb5_tcr,var = "loc",size = 1.0,opacity = 0.6,color.panel = loc_cols,main = NULL,do.raster = T,raster.dpi = 300)
+
+pdf(file = paste0(plot_dir,"fig1b_UMAP_TCRonly_loc.pdf"),height = 7,width = 7)
+p
+dev.off()
+```
+
+### b. Fig 1b - Simple Annot 
+```{r}
+p <- dittoDimPlot(pairs_csfpb5_tcr,var = "tcell_simple_annot",size = 1.0,opacity = 0.6,color.panel = annot_cols,main = NULL,do.raster = T,raster.dpi = 300)
+
+pdf(file = paste0(plot_dir,"fig1b_UMAP_TCRonly_tcell_simple_annot.pdf"),height = 7,width = 7)
+p
+dev.off()
+```
+
+### c. Fig 1b - Diagnosis
+```{r}
+p <- dittoDimPlot(pairs_csfpb5_tcr,var = "Diagnosis_Simple",size = 1.0,opacity = 0.6,color.panel = diagnosis_cols,main = NULL,do.raster = T,raster.dpi = 300)
+
+pdf(file = paste0(plot_dir,"fig1b_UMAP_TCRonly_diagnosis.pdf"),height = 7,width = 7)
+p
+dev.off()
+```
+
+### d. Fig 1b - Diagnosis split by loc
+```{r}
+p <- dittoDimPlot(pairs_csfpb5_tcr,var = "Diagnosis_Simple",size = 1.0,opacity = 0.6,color.panel = diagnosis_cols,main = NULL,do.raster = T,raster.dpi = 300,split.by = "loc")
+
+pdf(file = paste0(plot_dir,"fig1b_UMAP_TCRonly_diagnosis_splitby_loc.pdf"),width = 9,height = 7)
+p
+dev.off()
+```
+
+# ----------------------
+
+
+
+# 4. Heatmaps TCR Only
+
+### a. Fig 1e - CD8 CSF vs. PB
+```{r}
+pairs_csfpb5_cd8 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD8 T cells")])]
+
+Idents(pairs_csfpb5_cd8) <- pairs_csfpb5_cd8$loc
+levels(pairs_csfpb5_cd8) <- c("CSF","PB")
+
+dge_cd8 <- FindAllMarkers(pairs_csfpb5_cd8,logfc.threshold = 0.1)
+dge_cd8 <- dge_cd8[dge_cd8$p_val_adj < 0.05,]
+
+write.csv(dge_cd8,file = paste(c(plot_dir,"DGE_CD8_CSFvsPB.csv"),collapse = ""),quote = F)
+```
+
+
+### b. Fig 1f - CD4 CSF vs. PB
+```{r}
+pairs_csfpb5_cd4 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD4 T cells")])]
+
+Idents(pairs_csfpb5_cd4) <- pairs_csfpb5_cd4$loc
+levels(pairs_csfpb5_cd4) <- c("CSF","PB")
+
+dge_cd4 <- FindAllMarkers(pairs_csfpb5_cd4,logfc.threshold = 0.1)
+dge_cd4 <- dge_cd4[dge_cd4$p_val_adj < 0.05,]
+
+write.csv(dge_cd4,file = paste(c(plot_dir,"DGE_CD4_CSFvsPB.csv"),collapse = ""),quote = F)
+```
+
+
+
+### c. Fig 1g - CD8 - MS vs. Non-MS 
+```{r}
+pairs_csfpb5_cd8 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD8 T cells")])]
+
+
+ms_status <- pairs_csfpb5_cd8$Diagnostic_Category
+ms_status[ms_status %in% c("HC","OND")] <- "Non-MS"
+pairs_csfpb5_cd8$MS_status <- ms_status
+
+cells_ms <- names(pairs_csfpb5_cd8$MS_status[pairs_csfpb5_cd8$MS_status %in% "MS"])
+cells_nonms <- names(pairs_csfpb5_cd8$MS_status[pairs_csfpb5_cd8$MS_status %in% "Non-MS"])
+
+dge_cd8_ms_vs_nonms1 <- FindMarkers(pairs_csfpb5_cd8,ident.1 = cells_ms,ident.2 =cells_nonms,logfc.threshold = 0.0,)
+dge_cd8_ms_vs_nonms2 <- FindMarkers(pairs_csfpb5_cd8,ident.1 = cells_nonms,ident.2 =cells_ms,logfc.threshold = 0.0,)
+dge_cd8_ms_vs_nonms1$cluster <- "MS"
+dge_cd8_ms_vs_nonms2$cluster <- "Non-MS"
+dge_cd8_ms_vs_nonms1$gene    <- row.names(dge_cd8_ms_vs_nonms1)
+dge_cd8_ms_vs_nonms2$gene    <- row.names(dge_cd8_ms_vs_nonms2)
+dge_cd8_ms_vs_nonms          <- rbind(dge_cd8_ms_vs_nonms1,dge_cd8_ms_vs_nonms2)
+
+
+dge_cd8_ms_vs_nonms_sig <- dge_cd8_ms_vs_nonms[dge_cd8_ms_vs_nonms$p_val_adj < 0.05,]
+
+##### SAVE Results
+save(dge_cd8_ms_vs_nonms,file = file.path(object_dir,"volcano_dge_CD8_Fig1g.RData"))
+
+write.csv(dge_cd8_ms_vs_nonms_sig,file = paste(c(plot_dir,"DGE_CD8_MSvsNonMS.csv"),collapse = ""),quote = F)
+```
+
+
+### d. Fig 1g - CD4 - MS vs. Non-MS (v5)
+```{r}
+pairs_csfpb5_cd4 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD4 T cells")])]
+
+
+ms_status <- pairs_csfpb5_cd4$Diagnostic_Category
+ms_status[ms_status %in% c("HC","OND")] <- "Non-MS"
+pairs_csfpb5_cd4$MS_status <- ms_status
+
+cells_ms <- names(pairs_csfpb5_cd4$MS_status[pairs_csfpb5_cd4$MS_status %in% "MS"])
+cells_nonms <- names(pairs_csfpb5_cd4$MS_status[pairs_csfpb5_cd4$MS_status %in% "Non-MS"])
+
+dge_cd4_ms_vs_nonms1 <- FindMarkers(pairs_csfpb5_cd4,ident.1 = cells_ms,ident.2 =cells_nonms,logfc.threshold = 0.0,)
+dge_cd4_ms_vs_nonms2 <- FindMarkers(pairs_csfpb5_cd4,ident.1 = cells_nonms,ident.2 =cells_ms,logfc.threshold = 0.0,)
+dge_cd4_ms_vs_nonms1$cluster <- "MS"
+dge_cd4_ms_vs_nonms2$cluster <- "Non-MS"
+dge_cd4_ms_vs_nonms1$gene    <- row.names(dge_cd4_ms_vs_nonms1)
+dge_cd4_ms_vs_nonms2$gene    <- row.names(dge_cd4_ms_vs_nonms2)
+dge_cd4_ms_vs_nonms          <- rbind(dge_cd4_ms_vs_nonms1,dge_cd4_ms_vs_nonms2)
+
+
+dge_cd4_ms_vs_nonms_sig <- dge_cd4_ms_vs_nonms[dge_cd4_ms_vs_nonms$p_val_adj < 0.05,]
+
+##### SAVE Results
+write.csv(dge_cd4_ms_vs_nonms_sig,file = paste(c(plot_dir,"DGE_CD4_MSvsNonMS.csv"),collapse = ""),quote = F)
+```
+
+# ----------------------
+
+# 5. Volcano TCR only
+
+## --FUNCTION
+```{r}
+plotDGEviolin <- function(results_dge, YLIM = c(-10,300),XLIM = c(-1.2,1.2),label.genes.thresh=NULL) {
+  results_dge$gene <- row.names(results_dge)
+  p <- ggplot(results_dge) +
+    geom_point(aes(x=avg_log2FC, y=p_val_adj_log10, colour=sig_genes)) +
+    scale_color_manual(values=c("black", "red")) + 
+    ggtitle("Mov10 overexpression") +
+    xlab("log2 fold change") + 
+    ylab("-log10 adjusted p-value") +
+    theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) +
+    scale_y_continuous(limits = YLIM) +
+    scale_x_continuous(limits = XLIM)
+  
+  if(!is.null(label.genes.thresh)){
+    p <- p+geom_text_repel(data=filter(results_dge, results_dge$p_val_adj_log10>label.genes.thresh), aes(label=gene),size=5)
+  }
+  
+  return(p)
+}
+
+```
+
+
+### a. Fig 1e - CD8 CSF vs. PB
+```{r}
+cells_cd8_csf <- names(pairs_csfpb5_cd8$loc[pairs_csfpb5_cd8$loc %in% "CSF"])
+cells_cd8_pb <- names(pairs_csfpb5_cd8$loc[pairs_csfpb5_cd8$loc %in% "PB"])
+
+all_dge_cd8_csf <- FindMarkers(pairs_csfpb5_cd8,ident.1 = cells_cd8_csf,ident.2 =cells_cd8_pb,logfc.threshold = 0.0,)
+all_dge_cd8_pb <- FindMarkers(pairs_csfpb5_cd8,ident.1 = cells_cd8_pb,ident.2 =cells_cd8_csf,logfc.threshold = 0.0,)
+
+all_dge_cd8_csf$cluster <- "CSF"
+all_dge_cd8_pb$cluster  <- "PB"
+
+all_dge_cd8 <- rbind(all_dge_cd8_csf,all_dge_cd8_pb)
+```
+
+### --plot
+```{r}
+results_dge <- all_dge_cd8_csf
+sig_genes <- results_dge$p_val_adj
+sig_genes[sig_genes < 0.05] <- "Significant"
+sig_genes[! sig_genes %in% "Significant"] <- "Not Significant"
+results_dge$sig_genes <- sig_genes
+
+results_dge$p_val_adj_log10 <- -log10(results_dge$p_val_adj)
+results_dge$p_val_adj_log10[results_dge$p_val_adj_log10 == Inf] <- 300
+
+volcano_cd8_csf <- plotDGEviolin(results_dge)
+
+# without label
+pdf(paste0(plot_dir,"fig1e_volcano_CD8_CSFvsPB.pdf"))
+volcano_cd8_csf
+dev.off()
+```
+
+### b. Fig 1f - CD4 CSF vs. PB
+```{r}
+cells_cd4_csf <- names(pairs_csfpb5_cd4$loc[pairs_csfpb5_cd4$loc %in% "CSF"])
+cells_cd4_pb <- names(pairs_csfpb5_cd4$loc[pairs_csfpb5_cd4$loc %in% "PB"])
+
+all_dge_cd4_csf <- FindMarkers(pairs_csfpb5_cd4,ident.1 = cells_cd4_csf,ident.2 =cells_cd4_pb,logfc.threshold = 0.0,)
+all_dge_cd4_pb <- FindMarkers(pairs_csfpb5_cd4,ident.1 = cells_cd4_pb,ident.2 =cells_cd4_csf,logfc.threshold = 0.0,)
+
+all_dge_cd4_csf$cluster <- "CSF"
+all_dge_cd4_pb$cluster  <- "PB"
+
+all_dge_cd4 <- rbind(all_dge_cd4_csf,all_dge_cd4_pb)
+```
+
+### --plot
+```{r}
+results_dge <- all_dge_cd4_csf
+sig_genes <- results_dge$p_val_adj
+sig_genes[sig_genes < 0.05] <- "Significant"
+sig_genes[! sig_genes %in% "Significant"] <- "Not Significant"
+results_dge$sig_genes <- sig_genes
+
+results_dge$p_val_adj_log10 <- -log10(results_dge$p_val_adj)
+results_dge$p_val_adj_log10[results_dge$p_val_adj_log10 == Inf] <- 300
+
+volcano_cd4_csf <- plotDGEviolin(results_dge)
+
+pdf(paste0(plot_dir,"fig1f_volcano_CD4_CSFvsPB.pdf"))
+volcano_cd4_csf
+dev.off()
+```
+
+
+### c. Fig 1g - CD8 MS vs. Non-MS
+```{r}
+results_dge <- dge_cd8_ms_vs_nonms
+sig_genes <- results_dge$p_val_adj
+sig_genes[sig_genes < 0.05] <- "Significant"
+sig_genes[! sig_genes %in% "Significant"] <- "Not Significant"
+results_dge$sig_genes <- sig_genes
+
+results_dge$p_val_adj_log10 <- -log10(results_dge$p_val_adj)
+results_dge$p_val_adj_log10[results_dge$p_val_adj_log10 == Inf] <- 150
+
+results_dge <- results_dge[results_dge$cluster %in% "MS",]
+volcano_cd8 <- plotDGEviolin(results_dge,YLIM = c(-10,150),XLIM = c(-1.0,1.0))
+
+pdf(paste0(plot_dir,"fig1g_volcano_CD8_MSvsNonMS.pdf"))
+volcano_cd8
+dev.off()
+
+results_dge_fig1g_CD8 <- results_dge
+```
+
+
+
+### d. Fig 1g - CD4 MS vs. Non-MS 
+```{r}
+results_dge <- dge_cd4_ms_vs_nonms
+sig_genes <- results_dge$p_val_adj
+sig_genes[sig_genes < 0.05] <- "Significant"
+sig_genes[! sig_genes %in% "Significant"] <- "Not Significant"
+results_dge$sig_genes <- sig_genes
+
+results_dge$p_val_adj_log10 <- -log10(results_dge$p_val_adj)
+results_dge$p_val_adj_log10[results_dge$p_val_adj_log10 == Inf] <- 300
+
+results_dge <- results_dge[results_dge$cluster %in% "MS",]
+volcano_cd4 <- plotDGEviolin(results_dge,YLIM = c(-10,300),XLIM = c(-1.0,1.0))
+
+pdf(paste0(plot_dir,"fig1g_volcano_CD4_MSvsNonMS.pdf"))
+volcano_cd4
+dev.off()
+
+results_dge_fig1g_CD4 <- results_dge
+```
+
+### e. Write CSVs DGE
+```{r}
+write.csv(results_dge_fig1g_CD4,file = paste0(plot_dir,"fig1g_CD4_MSvsNonMS_DGE_table.csv"),quote = F,row.names = F)
+
+write.csv(results_dge_fig1g_CD8,file = paste0(plot_dir,"fig1g_CD8_MSvsNonMS_DGE_table.csv"),quote = F,row.names = F)
+```
+
+# ----------------------
+
+# 6. Volcano DGE
+
+### a. Fig 1g CD8  CSF High vs. Non-Exp
+```{r}
+pairs_csfpb5_cd8 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD8 T cells")])]
+
+pairs_cd8_csf <- pairs_csfpb5_cd8[,names(pairs_csfpb5_cd8$loc[pairs_csfpb5_cd8$loc %in% c("CSF")])]
+
+# Keep only high and non-exp
+pairs_cd8_csf <- pairs_cd8_csf[,names(pairs_cd8_csf$clonotype_expansion_categ[pairs_cd8_csf$clonotype_expansion_categ %in% c("High","Non-expanded")])]
+
+Idents(pairs_cd8_csf) <- pairs_cd8_csf$clonotype_expansion_categ
+dge_csf_cd8 <- FindAllMarkers(pairs_cd8_csf,logfc.threshold = 0.0)
+dge_csf_cd8_high <- dge_csf_cd8[dge_csf_cd8$cluster %in% c("High"),]
+
+```
+#### --CSV
+```{r}
+# Filter out genes with even gene expression between comparison groups
+dge_csf_cd8_high$pct.diff <- abs(dge_csf_cd8_high$pct.1 - dge_csf_cd8_high$pct.2)
+dge_sub <- dge_csf_cd8_high[dge_csf_cd8_high$pct.diff < 0.02 & dge_csf_cd8_high$pct.1 > 0.98 & dge_csf_cd8_high$pct.2 > 0.98,]
+
+dge_csf_cd8_high_sub <- dge_csf_cd8_high[! dge_csf_cd8_high$gene %in% dge_sub$gene, ]
+
+write.csv(dge_csf_cd8_high_sub,file = paste0(plot_dir,"DGE_CSF_CD8_High.csv"),quote = F)
+```
+
+#### --With/Without labels
+```{r}
+top_genes <- dge_csf_cd8_high_sub
+results   <- mutate(top_genes, sig=ifelse(-log10(top_genes$p_val_adj)>5, "FDR<0.05", "Not Sig"))
+
+p = ggplot(results, aes(avg_logFC, -log10(p_val_adj+10^-20))) +
+      geom_point(aes(col=sig)) +
+      scale_color_manual(values=c("red", "black")) +
+      scale_y_continuous(limits = c(0, 20)) +
+      scale_x_continuous(limits = c(-1,1)) +
+      ggtitle("CD8 CSF High vs. Non-expanded") + theme(plot.title = element_text(hjust = 0.5)) + 
+      xlab("Log FC") +
+      ylab("-log10 p-value") +
+      labs(" ")
+    
+## Without gene labels
+pdf(file = paste(plot_dir,"fig1g_volcano_CD8_CSF_HighvsNonExp.pdf"))
+print(p)
+dev.off()
+
+
+## With gene labels
+p <- p+geom_text_repel(data=filter(results, -log10(top_genes$p_val_adj)>5), aes(label=gene), size = 5)
+
+pdf(file = paste(plot_dir,"fig1g_volcano_CD8_CSF_HighvsNonExp.LABELS.pdf"))
+print(p)
+dev.off()
+```
+
+
+### b. Fig 1h CD4  CSF High vs. Non-Exp
+```{r}
+pairs_csfpb5_cd4 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD4 T cells")])]
+
+pairs_cd4_csf <- pairs_csfpb5_cd4[,names(pairs_csfpb5_cd4$loc[pairs_csfpb5_cd4$loc %in% c("CSF")])]
+
+# Keep only high and non-exp
+pairs_cd4_csf <- pairs_cd4_csf[,names(pairs_cd4_csf$clonotype_expansion_categ[pairs_cd4_csf$clonotype_expansion_categ %in% c("High","Non-expanded")])]
+
+Idents(pairs_cd4_csf) <- pairs_cd4_csf$clonotype_expansion_categ
+dge_csf_cd4 <- FindAllMarkers(pairs_cd4_csf,logfc.threshold = 0.0)
+dge_csf_cd4_high <- dge_csf_cd4[dge_csf_cd4$cluster %in% c("High"),]
+```
+
+#### --CSV
+```{r}
+# Filter out genes with even gene expression between comparison groups
+dge_csf_cd4_high$pct.diff <- abs(dge_csf_cd4_high$pct.1 - dge_csf_cd4_high$pct.2)
+dge_sub <- dge_csf_cd4_high[dge_csf_cd4_high$pct.diff < 0.02 & dge_csf_cd4_high$pct.1 > 0.98 & dge_csf_cd4_high$pct.2 > 0.98,]
+
+dge_csf_cd4_high_sub <- dge_csf_cd4_high[! dge_csf_cd4_high$gene %in% dge_sub$gene, ]
+
+
+write.csv(dge_csf_cd4_high,file = paste0(plot_dir,"DGE_CSF_CD4_High.csv"),quote = F)
+```
+
+#### --With/Without labels
+```{r}
+top_genes <- dge_csf_cd4_high
+results   <- mutate(top_genes, sig=ifelse(-log10(top_genes$p_val_adj)>5, "FDR<0.05", "Not Sig"))
+
+p = ggplot(results, aes(avg_logFC, -log10(p_val_adj+10^-20))) +
+      geom_point(aes(col=sig)) +
+      scale_color_manual(values=c("red", "black")) +
+      scale_y_continuous(limits = c(0, 20)) +
+      scale_x_continuous(limits = c(-1,1)) +
+      ggtitle("CD4 CSF High vs. Non-expanded") + theme(plot.title = element_text(hjust = 0.5)) + 
+      xlab("Log FC") +
+      ylab("-log10 p-value") +
+      labs(" ")
+    
+## Without gene labels
+pdf(file = paste(plot_dir,"fig1g_volcano_CD4_CSF_HighvsNonExp.pdf"))
+print(p)
+dev.off()
+
+
+## With gene labels
+p <- p+geom_text_repel(data=filter(results, -log10(top_genes$p_val_adj)>5), aes(label=gene), size = 5)
+
+pdf(file = paste(plot_dir,"fig1g_volcano_CD4_CSF_HighvsNonExp.LABELS.pdf"))
+print(p)
+dev.off()
+```
+
