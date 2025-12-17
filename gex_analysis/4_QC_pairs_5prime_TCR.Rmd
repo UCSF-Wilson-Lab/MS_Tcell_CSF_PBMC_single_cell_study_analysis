@@ -1,0 +1,491 @@
+---
+title: "QC TCR object"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+source("Resources/functions_sc_analysis.R")
+
+library(Seurat)
+library(knitr)
+library(reshape2)
+library(pheatmap)
+library(SingleR)
+library(kableExtra)
+library(devtools)
+library(dplyr)
+library(parallel)
+library(data.table)
+library(ggplot2)
+library(monocle3)
+
+# plots
+library(RColorBrewer)
+```
+
+
+# 1. Load pairs object 
+```{r}
+load("./objects/seurat_obj.csfpb.Pairs.UMIregress.TCR.postDF.RData")
+```
+
+# 2. Add metadata
+```{r}
+tcr_metadata <- "./metadata/metadata.csv"
+seurat.obj.csfpbmc.pairs <- addRNAseqMetaData(seurat.obj.csfpbmc.pairs,metadata_sheet = tcr_metadata)
+```
+
+# 3. Remove Doublets
+```{r}
+pairs_csfpb5 <- seurat.obj.csfpbmc.pairs[,names(seurat.obj.csfpbmc.pairs$doublet.finder.ann[seurat.obj.csfpbmc.pairs$doublet.finder.ann %in% c("Singlet")])]
+```
+
+# 5. Remove > 10% mitochrondrial expression
+```{r}
+pairs_csfpb5_fin <- pairs_csfpb5[,names(pairs_csfpb5$percent.mito[pairs_csfpb5$percent.mito < 10.0])]
+```
+
+
+# 6. Re-cluster
+
+### a. determine total PCs (12)
+```{r}
+ElbowPlot(pairs_csfpb5_fin)  # 5 PCs is good enough for the B cells
+pct <- pairs_csfpb5_fin[["pca"]]@stdev / sum(pairs_csfpb5_fin[["pca"]]@stdev) * 100
+# Calculate cumulative percents for each PC
+cumu <- cumsum(pct)
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5
+co1 <- which(cumu > 90 & pct < 5)[1]
+co1
+
+
+co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+
+# Minimum of the two calculation
+pcs <- min(co1, co2)
+
+plot_df <- data.frame(pct = pct, 
+           cumu = cumu, 
+           rank = 1:length(pct))
+# Elbow plot to visualize 
+  ggplot(plot_df, aes(cumu, pct, label = rank, color = rank > pcs)) + 
+  geom_text() + 
+  geom_vline(xintercept = 90, color = "grey") + 
+  geom_hline(yintercept = min(pct[pct > 5]), color = "grey") +
+  theme_bw()
+
+
+```
+
+### b. re-cluster
+```{r}
+pairs_csfpb5_fin <- recluster_seurat_obj_v3(pairs_csfpb5_fin,dims = 1:12,npca = 12)
+```
+
+
+# 7. Add SingleR results
+
+### a. load results
+```{r}
+# BlueprintENCODE reference
+load("./objects/pairs_singler_results/singler_obj.csfpb.BlueprintEncodeRef.MAIN.5prime.RData")
+load("./objects/pairs_singler_results/singler_obj.csfpb.BlueprintEncodeRef.SUB.5prime.RData")
+
+# Monaco Immune reference
+load("./objects/pairs_singler_results/singler_obj.csfpb.MonacoImmuneRef.MAIN.5prime.RData")
+load("./objects/pairs_singler_results/singler_obj.csfpb.MonacoImmuneRef.5prime.RData")
+```
+
+### b. add to object
+```{r}
+# Add BlueprintENCODE ref annot
+pairs_csfpb5_fin <- addSingleRtoSeurat(
+  seurat = pairs_csfpb5_fin,
+  singler.main = singler.obj.csfpbmc.bencodeRef.main,
+  singler.fine = singler.obj.csfpbmc.bencodeRef.sub,
+  main.name = "main.cell.annot.bencode",fine.name = "subtype.cell.annot.bencode")
+
+# Add monaco immune ref annot
+pairs_csfpb5_fin <- addSingleRtoSeurat(
+  seurat = pairs_csfpb5_fin,
+  singler.main = singler.obj.csfpbmc.monacoRef.main,
+  singler.fine = singler.obj.csfpbmc.monacoRef.sub,
+  main.name = "main.cell.annot.monaco",fine.name = "subtype.cell.annot.monaco")
+```
+
+
+# 8. Change Resolution
+```{r}
+pairs_csfpb5_fin <- FindClusters(pairs_csfpb5_fin, resolution = 0.4)
+
+UMAPPlot(object = pairs_csfpb5_fin, group.by="seurat_clusters", pt.size=0.3, label = T, combine = FALSE, repel = TRUE)
+```
+
+# >>> SAVE
+```{r}
+fh <- "./objects/tcell_obj_PAIRS.12PCs.RData"
+save(pairs_csfpb5_fin,file = fh)
+```
+
+# ----------------------------------
+
+# QC remove Platelets/Blood cells
+
+## 1. Add clonotype results
+```{r}
+pairs_csfpb5_fin <- addImmcantationResults(pairs_csfpb5_fin,TYPE = "TCR",igseq_results = "./tables/FORMATTED_immcantation_results_table.ALL.TCR.v3.1.csv")
+```
+
+#### --DGE select clusters
+```{r}
+Idents(pairs_csfpb5_fin) <- pairs_csfpb5_fin$seurat_clusters
+
+# Cluster 0
+dge_clus0 <- FindMarkers(pairs_csfpb5_fin, ident.1 = c("0"),logfc.threshold = 0.1)
+dge_clus0$gene <- row.names(dge_clus0)
+# Cluster 9
+dge_clus9 <- FindMarkers(pairs_csfpb5_fin, ident.1 = c("9"),logfc.threshold = 0.1)
+dge_clus9$gene <- row.names(dge_clus9)
+# Cluster 10
+dge_clus10 <- FindMarkers(pairs_csfpb5_fin, ident.1 = c("10"),logfc.threshold = 0.1)
+dge_clus10$gene <- row.names(dge_clus10)
+```
+
+## 2. TCR presence per Cluster
+```{r}
+tcr_pos_col <- pairs_csfpb5_fin$sample.name
+
+# Subset out cells with TCR
+tcr_only <- pairs_csfpb5_fin[,names(pairs_csfpb5_fin$expanded_clonotype_status_imm[pairs_csfpb5_fin$expanded_clonotype_status_imm %in% c("0","1")])]
+
+tcr_pos_col[! names(tcr_pos_col) %in% colnames(tcr_only)] <- "No VDJ"
+tcr_pos_col[names(tcr_pos_col) %in% colnames(tcr_only)] <- "Has TCR"
+
+pairs_csfpb5_fin$tcr_status <- tcr_pos_col
+
+
+tcr_summary_per_clus <- create_subtype_summary_df(annot_vec = pairs_csfpb5_fin$tcr_status,categ_vec = pairs_csfpb5_fin$seurat_clusters)
+```
+
+## 3. Omit Platelet/Blood cell clusters
+cluster 12: omit only cells without TCR (~1300 cells have TCR)
+cluster 16: omit everything
+cluster 18: omit everything
+```{r}
+pairs_csfpb5 <- pairs_csfpb5_fin
+
+tcr_overlap_vec <- names(pairs_csfpb5_fin$expanded_clonotype_status_imm[pairs_csfpb5_fin$expanded_clonotype_status_imm %in% c("0","1")])
+
+# clus 12
+clus12 <- pairs_csfpb5_fin[,names(pairs_csfpb5_fin$seurat_clusters[pairs_csfpb5_fin$seurat_clusters %in% c("12")])]
+platelets_clus12 <- colnames(clus12)[! colnames(clus12) %in% tcr_overlap_vec]
+pairs_csfpb5 <- pairs_csfpb5[,! colnames(pairs_csfpb5) %in% platelets_clus12]
+
+# 16 & 18
+pairs_csfpb5 <- pairs_csfpb5[,names(pairs_csfpb5$seurat_clusters[! pairs_csfpb5$seurat_clusters %in% c("16","18")])]
+```
+
+## 4. Re-cluster PCs (9)
+```{r}
+opt_pcs_plot <- PlotOptimalPCsforSeurat(pairs_csfpb5)
+
+# Remove all V genes, TCR and BCR
+all_genes <- row.names(pairs_csfpb5)
+trbv_genes <- all_genes[grep("TRBV",all_genes)]
+trav_genes <- all_genes[grep("TRAV",all_genes)]
+ighv_genes <- all_genes[grep("IGHV",all_genes)]
+igkv_genes <- all_genes[grep("IGKV",all_genes)]
+iglv_genes <- all_genes[grep("IGLV",all_genes)]
+all_vgenes <- c(trav_genes,trbv_genes,ighv_genes,igkv_genes,iglv_genes)
+
+pairs_csfpb5_nov <- pairs_csfpb5[! row.names(pairs_csfpb5) %in% all_vgenes,]
+```
+
+### a. with all genes/ with no TCR V genes
+- previously 14, now optimal PCs = 9
+```{r}
+pairs_csfpb5_nov <- recluster_seurat_obj_v3(pairs_csfpb5_nov,dims = 1:9,npca = 9)
+```
+
+## 5. Change Resolution (FindClusters)
+```{r}
+pairs_csfpb5_nov <- FindClusters(pairs_csfpb5_nov, resolution = 0.4)
+```
+
+
+# >>> SAVE
+```{r}
+fh <- "./objects/tcell_obj_PAIRS.9PCs.CLEAN.RData"
+save(pairs_csfpb5_nov,file = fh)
+```
+
+# ----------------------------------
+
+# MANUAL ANNOTATION
+
+## 1. Annotation breakdowns
+
+### a. Monaco summary dataframe
+```{r}
+monaco_subtype_summary_per_clus <- create_subtype_summary_df(annot_vec = pairs_csfpb5_nov$subtype.cell.annot.monaco,categ_vec = pairs_csfpb5_nov$seurat_clusters)
+```
+
+### b. Paper ID Diagnois Loc Summary dataframe
+```{r}
+sample_summary_per_clus <- create_subtype_summary_df(annot_vec = pairs_csfpb5_nov$Paper_ID_Diagnosis_loc,categ_vec = pairs_csfpb5_nov$seurat_clusters)
+```
+
+### c. TCR summary dataframe
+```{r}
+tcr_pos_col <- pairs_csfpb5_nov$sample.name
+
+# Subset out cells with TCR
+tcr_only <- pairs_csfpb5_nov[,names(pairs_csfpb5_nov$expanded_clonotype_status_imm[pairs_csfpb5_nov$expanded_clonotype_status_imm %in% c("0","1")])]
+
+tcr_pos_col[! names(tcr_pos_col) %in% colnames(tcr_only)] <- "No VDJ"
+tcr_pos_col[names(tcr_pos_col) %in% colnames(tcr_only)] <- "Has TCR"
+
+pairs_csfpb5_nov$tcr_status <- tcr_pos_col
+
+
+tcr_summary_per_clus <- create_subtype_summary_df(annot_vec = pairs_csfpb5_nov$tcr_status,categ_vec = pairs_csfpb5_nov$seurat_clusters)
+```
+
+
+## 2. DGE select clusters for QC
+
+#### --DGE select clusters
+```{r}
+Idents(pairs_csfpb5_nov) <- pairs_csfpb5_nov$seurat_clusters
+dge_clus0 <- FindMarkers(pairs_csfpb5_nov, ident.1 = c("0"),logfc.threshold = 0.1)
+dge_clus0$gene <- row.names(dge_clus0)
+
+dge_clus1 <- FindMarkers(pairs_csfpb5_nov, ident.1 = c("1"),logfc.threshold = 0.1)
+dge_clus1$gene <- row.names(dge_clus1)
+
+dge_clus9 <- FindMarkers(pairs_csfpb5_nov, ident.1 = c("9"),logfc.threshold = 0.1)
+dge_clus9$gene <- row.names(dge_clus9)
+
+dge_clus3 <- FindMarkers(pairs_csfpb5_nov, ident.1 = c("3"),logfc.threshold = 0.1)
+dge_clus3$gene <- row.names(dge_clus3)
+
+```
+
+
+## 3. Add Manual Annotation Column
+
+### a. Main Types
+```{r}
+manual_annot_main        <- as.character(pairs_csfpb5_nov$seurat_clusters)
+names(manual_annot_main) <- names(pairs_csfpb5_nov$seurat_clusters) 
+
+manual_annot_main[manual_annot_main %in% c("0")] <- "CD4 Tem"
+manual_annot_main[manual_annot_main %in% c("1")] <- "CD4 Tem"
+manual_annot_main[manual_annot_main %in% c("2")] <- "CD8 Tem"
+manual_annot_main[manual_annot_main %in% c("3")] <- "Naive T-cells"
+manual_annot_main[manual_annot_main %in% c("4")] <- "CD8 Tem"
+manual_annot_main[manual_annot_main %in% c("5")] <- "Naive T-cells"
+manual_annot_main[manual_annot_main %in% c("6")] <- "Monocytes"
+manual_annot_main[manual_annot_main %in% c("7")] <- "B cells"
+manual_annot_main[manual_annot_main %in% c("8")] <- "Naive T-cells"
+manual_annot_main[manual_annot_main %in% c("9")]  <- "Naive T-cells"
+manual_annot_main[manual_annot_main %in% c("10")] <- "NK cells"
+manual_annot_main[manual_annot_main %in% c("11")] <- "Macrophage"
+manual_annot_main[manual_annot_main %in% c("12")] <- "Monocytes"
+manual_annot_main[manual_annot_main %in% c("13")] <- "Myeloid DC"
+manual_annot_main[manual_annot_main %in% c("14")] <- "pDC and Plasma Cells"
+
+pairs_csfpb5_nov$main.cell.annot.manual <- manual_annot_main
+```
+
+### b. subtype
+```{r}
+manual_annot_subtype <- as.character(pairs_csfpb5_nov$seurat_clusters)
+names(manual_annot_subtype) <- names(pairs_csfpb5_nov$seurat_clusters)
+
+manual_annot_subtype[manual_annot_subtype %in% c("0")] <- "CD4 Tem 1"
+manual_annot_subtype[manual_annot_subtype %in% c("1")] <- "CD4 Tem 2"
+
+manual_annot_subtype[manual_annot_subtype %in% c("2")] <- "CD8 Tem 1 "
+manual_annot_subtype[manual_annot_subtype %in% c("4")] <- "CD8 Tem 2"
+
+manual_annot_subtype[manual_annot_subtype %in% c("3")] <- "Naive T-cells 1"
+manual_annot_subtype[manual_annot_subtype %in% c("5")] <- "Naive T-cells 2"
+manual_annot_subtype[manual_annot_subtype %in% c("8")] <- "Naive T-cells 3"
+manual_annot_subtype[manual_annot_subtype %in% c("9")] <- "Naive T-cells 4"
+
+manual_annot_subtype[manual_annot_subtype %in% c("6")] <- "Monocytes 1"
+manual_annot_subtype[manual_annot_subtype %in% c("12")] <- "Monocytes 2"
+manual_annot_subtype[manual_annot_subtype %in% c("10")] <- "NK cells"
+manual_annot_subtype[manual_annot_subtype %in% c("7")] <- "B cells"
+manual_annot_subtype[manual_annot_subtype %in% c("14")] <- "pDC and Plasma Cells"
+
+manual_annot_subtype[manual_annot_subtype %in% c("11")] <- "Macrophage"
+
+manual_annot_subtype[manual_annot_subtype %in% c("13")] <- "Myeloid DC"
+
+pairs_csfpb5_nov$subtype.cell.annot.manual <- manual_annot_subtype
+```
+
+### c. separate pDC and PC in Cluster 14 (PENDING)
+* subset clusters 7 and 14 to capture all B cells
+* use UMAP coord to isolate PC/pDC cluster
+```{r}
+pairs_nov_sub <- pairs_csfpb5_nov[,names(pairs_csfpb5_nov$seurat_clusters[pairs_csfpb5_nov$seurat_clusters %in% c("7","14")])]
+
+outlier_sub <- subsetObjByUMAPcoords(seurat_obj = pairs_nov_sub,UMAP1 = -5,UMAP2 = 5,LESSTHAN_UMAP1 = TRUE,LESSTHAN_UMAP2 = TRUE, INVERSE_SUBSET = TRUE)
+
+pdc_pc_sub <- subsetObjByUMAPcoords(seurat_obj = pairs_nov_sub,UMAP1 = -5,UMAP2 = -5,LESSTHAN_UMAP1 = TRUE,LESSTHAN_UMAP2 = TRUE)
+
+pdc_sub <- subsetObjByUMAPcoords(seurat_obj = pdc_pc_sub,UMAP1 = -8.5,UMAP2 = -6.25,LESSTHAN_UMAP1 = TRUE,LESSTHAN_UMAP2 = TRUE)
+
+pc_sub <- subsetObjByUMAPcoords(seurat_obj = pdc_pc_sub,UMAP1 = -8.5,UMAP2 = -6.25,LESSTHAN_UMAP1 = TRUE,LESSTHAN_UMAP2 = TRUE, INVERSE_SUBSET = TRUE)
+
+UMAPPlot(object = pdc_pc_sub, group.by="seurat_clusters", pt.size=0.3, label = T, combine = FALSE, repel = TRUE)
+```
+
+### d. UPDATE manual annotations B cells
+```{r}
+# REMOVE B cell outliers
+pairs_csfpb5_nov <- pairs_csfpb5_nov[,! colnames(pairs_csfpb5_nov) %in% colnames(outlier_sub)]
+
+# Update Main Manual annotations
+main_manual_annot <- pairs_csfpb5_nov$main.cell.annot.manual
+main_manual_annot[names(main_manual_annot) %in% colnames(pdc_sub)] <- "pDC"
+main_manual_annot[names(main_manual_annot) %in% colnames(pc_sub)] <- "Plasma Cells"
+pairs_csfpb5_nov$main.cell.annot.manual <- main_manual_annot
+
+# Upade Subtype Manual annotations
+sub_manual_annot <- pairs_csfpb5_nov$subtype.cell.annot.manual
+sub_manual_annot[names(sub_manual_annot) %in% colnames(pdc_sub)] <- "pDC"
+sub_manual_annot[names(sub_manual_annot) %in% colnames(pc_sub)] <- "Plasma Cells"
+pairs_csfpb5_nov$subtype.cell.annot.manual <- sub_manual_annot
+```
+
+# >>> SAVE
+```{r}
+fh <- "./objects/tcell_obj_PAIRS.9PCs.CLEAN.RData"
+save(pairs_csfpb5_nov,file = fh)
+```
+
+
+# ----------------------------------
+
+# Create TCR Object
+
+# 1. Add TCR results
+```{r}
+pairs_csfpb5_nov <- addImmcantationResults(pairs_csfpb5_nov,TYPE = "TCR",igseq_results = "./tables/FORMATTED_immcantation_results_table.ALL.TCR.v3.1.csv")
+```
+
+
+# 2. TCR overlap + Re-cluster
+```{r}
+### TCR overlap
+pairs_csfpb5_tcr <- pairs_csfpb5_nov[,names(pairs_csfpb5_nov$expanded_clonotype_status_imm[pairs_csfpb5_nov$expanded_clonotype_status_imm %in% c("0","1")])]
+
+pairs_csfpb5_tcr <- recluster_seurat_obj_v3(pairs_csfpb5_tcr,dims = 1:5,npca = 5)
+```
+
+# 3. Change Resolution (FindClusters)
+```{r}
+pairs_csfpb5_tcr <- FindClusters(pairs_csfpb5_tcr, resolution = 0.4)
+```
+
+# 4. Re-annotate CD4/CD8 T cells
+
+Any cell with CD8 expression is a CD8 T cell, otherwise it is a CD4 T cell
+
+```{r}
+# B cell Activation
+CD8_pos_tcells <- colnames(subset(pairs_csfpb5_tcr, subset = CD8A > 0 & CD8B > 0))
+CD8A_pos_tcells <- colnames(subset(pairs_csfpb5_tcr, subset = CD8A > 0))
+CD8B_pos_tcells <- colnames(subset(pairs_csfpb5_tcr, subset = CD8B > 0))
+
+tcell_simple_annot <- pairs_csfpb5_tcr$main.cell.annot.bencode
+tcell_simple_annot[names(tcell_simple_annot) %in% CD8_pos_tcells] <- "CD8 T cells"
+tcell_simple_annot[names(tcell_simple_annot) %in% CD8A_pos_tcells] <- "CD8 T cells"
+tcell_simple_annot[names(tcell_simple_annot) %in% CD8B_pos_tcells] <- "CD8 T cells"
+tcell_simple_annot[! tcell_simple_annot %in% c("CD8 T cells")] <- "CD4 T cells"
+
+pairs_csfpb5_tcr$tcell_simple_annot <- tcell_simple_annot
+
+```
+
+
+# 5. Upadate PAIRs object with Simple CD4/CD8 Annotations
+```{r}
+pairs_simple_annot <- pairs_csfpb5_nov$main.cell.annot.manual
+tcr_simple_annot   <- pairs_csfpb5_tcr$tcell_simple_annot
+cd4_annot          <- tcr_simple_annot[tcr_simple_annot %in% c("CD4 T cells")]
+cd8_annot          <- tcr_simple_annot[tcr_simple_annot %in% c("CD8 T cells")]
+
+pairs_simple_annot[names(pairs_simple_annot) %in% names(cd4_annot)] <- "CD4 T cells"
+pairs_simple_annot[names(pairs_simple_annot) %in% names(cd8_annot)] <- "CD8 T cells"
+
+pairs_csfpb5_nov$tcell_simple_annot <- pairs_simple_annot
+```
+
+
+# >>> SAVE TCR OBJECT
+```{r}
+fh <- "./objects/tcell_igseq_obj_PAIRS.RData"
+save(pairs_csfpb5_tcr,file = fh)
+```
+
+# ----------------------------------
+
+# CLEAN TCR object based on mTCR Table
+
+# 1. Add TCR results
+```{r}
+mtcr_table_fh <- "./tables/mtcr_table_ALL_TCR.v3.1.CLEAN.csv"
+
+pairs_csfpb5_nov <- addImmcantationResults(pairs_csfpb5_nov,TYPE = "TCR",igseq_results = mtcr_table_fh,gex_sample_col = 6,seurat_cell_barcode_col = 7)
+```
+
+# 2. TCR overlap + Re-cluster
+```{r}
+### TCR overlap
+pairs_csfpb5_tcr <- pairs_csfpb5_nov[,names(pairs_csfpb5_nov$expanded_clonotype_status_imm[pairs_csfpb5_nov$expanded_clonotype_status_imm %in% c("0","1")])]
+
+pairs_csfpb5_tcr <- recluster_seurat_obj_v3(pairs_csfpb5_tcr,dims = 1:5,npca = 5)
+```
+
+# 3. Change Resolution (FindClusters)
+```{r}
+pairs_csfpb5_tcr <- FindClusters(pairs_csfpb5_tcr, resolution = 0.4)
+```
+
+# 4. Re-annotate CD4/CD8 T cells
+
+Any cell with CD8 expression is a CD8 T cell, otherwise it is a CD4 T cell
+
+```{r}
+# B cell Activation
+CD8_pos_tcells <- colnames(subset(pairs_csfpb5_tcr, subset = CD8A > 0 & CD8B > 0))
+CD8A_pos_tcells <- colnames(subset(pairs_csfpb5_tcr, subset = CD8A > 0))
+CD8B_pos_tcells <- colnames(subset(pairs_csfpb5_tcr, subset = CD8B > 0))
+
+tcell_simple_annot <- pairs_csfpb5_tcr$main.cell.annot.bencode
+tcell_simple_annot[names(tcell_simple_annot) %in% CD8_pos_tcells] <- "CD8 T cells"
+tcell_simple_annot[names(tcell_simple_annot) %in% CD8A_pos_tcells] <- "CD8 T cells"
+tcell_simple_annot[names(tcell_simple_annot) %in% CD8B_pos_tcells] <- "CD8 T cells"
+tcell_simple_annot[! tcell_simple_annot %in% c("CD8 T cells")] <- "CD4 T cells"
+
+pairs_csfpb5_tcr$tcell_simple_annot <- tcell_simple_annot
+
+```
+
+# >>> SAVE TCR OBJECT
+```{r}
+fh <- "./objects/tcell_igseq_obj_PAIRS.RData"
+save(pairs_csfpb5_tcr,file = fh)
+```
+
