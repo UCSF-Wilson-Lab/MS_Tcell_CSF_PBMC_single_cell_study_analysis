@@ -1,0 +1,214 @@
+---
+title: "Merge GLIPH2 results with TCR mTCR table"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+### SQL command to collect the patient information
+library(Seurat)
+library(stringr)
+library(dplyr)
+library(data.table)
+
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+
+# GLIPH2 results
+gliph_results_fh <- "./gliph_results/all_CSF_GLIPH2/AllCSF_cluster.csv"
+
+# Functions
+source("Resources/functions_sc_analysis.R")
+```
+
+# Load TCR mAb table
+```{r}
+mab_table_fh <- "./tables/mab_table_ALL_TCR.v3.1.CLEAN.csv"
+mab_table     <- read.csv(mab_table_fh,stringsAsFactors=FALSE)
+
+gliph_resuls_csf <- read.csv(gliph_results_fh,header = T,stringsAsFactors = F)
+
+all_groups <- unique(gliph_resuls_csf$index)
+```
+
+### --remove all non overlapping cells
+```{r}
+mab_table <- mab_table[! mab_table$subtype.cell.annot.manual %in% "No Annot",]
+```
+
+
+# Load TCR RNA-Seq Object
+```{r}
+load("./objects/tcell_igseq_obj_PAIRS.RData")
+
+# Subset CD4 and CD8
+pairs_cd4 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD4 T cells")])]
+pairs_cd8 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD8 T cells")])]
+```
+
+
+# 1. Create Useful columns for mAb Table
+
+### a. add beta:alpha column
+```{r}
+clone_list <- unique(mab_table$MERGED_clonotypeID_imm)
+
+alpha_beta_aa_col <- mab_table$MERGED_clonotypeID_imm
+
+for (clone in clone_list) {
+  clone_df <- mab_table[mab_table$MERGED_clonotypeID_imm %in% clone,]
+  trb_df  <- clone_df[clone_df$chain %in% "TRB",]
+  tra_df  <- clone_df[clone_df$chain %in% "TRA",]
+  concat_chain <- paste(c(unique(tra_df$CDR3_AA),":",unique(trb_df$CDR3_AA)),collapse = "")
+  alpha_beta_aa_col[alpha_beta_aa_col %in% clone] <- concat_chain
+}
+
+mab_table$CDR3ab_AA <- alpha_beta_aa_col
+```
+
+### b. add to GLIPH results
+```{r}
+gliph_resuls_csf$CRD3ab_AA <- paste(gliph_resuls_csf$TcRa,gliph_resuls_csf$TcRb,sep = ":")
+```
+
+# 2. Add CSF clonotype frequency column
+```{r}
+clone_counts_df <- read.csv("./tables/patient_clonotype_pcts/ALL_PATIENTS_clonotype_counts.csv")
+
+csf_clone_freq        <- clone_counts_df$pct_CSF
+names(csf_clone_freq) <- clone_counts_df$X 
+
+# Add CSf clonotype frequencies to mAb table
+csf_clone_freq_col <- mab_table$MERGED_clonotypeID_imm
+
+clone_list <- unique(csf_clone_freq_col)
+for (clone in clone_list) {
+  freq <- unique(csf_clone_freq[clone])
+  csf_clone_freq_col[csf_clone_freq_col %in% clone] <- freq
+}
+
+mab_table$clonotype_CSF_freq <- csf_clone_freq_col
+```
+
+
+# 3. Add GLIPH results into mAb table
+
+### a. GLIPH status 
+```{r}
+# Gliph results status 
+gliph_status_col <- mab_table$CDR3ab_AA
+gliph_status_col[gliph_status_col %in% unique(gliph_resuls_csf$CRD3ab_AA)] <- "1"
+gliph_status_col[! gliph_status_col %in% "1"] <- "0"
+mab_table$gliph_status <- gliph_status_col
+```
+
+### b. Add index groups
+```{r}
+target_cells <- mab_table[mab_table$CDR3ab_AA %in% gliph_resuls_csf$CRD3ab_AA,]
+target_cells <- unique(target_cells$igseq_barcode)
+
+index_col        <- mab_table$CDR3ab_AA
+names(index_col) <- mab_table$igseq_barcode
+index_col[! names(index_col) %in% target_cells] <- ""
+
+target_cdr3ab <- unique(as.character(index_col[! index_col %in% ""]))
+
+
+for (ab in target_cdr3ab) {
+  gliph_sub <- gliph_resuls_csf[gliph_resuls_csf$CRD3ab_AA %in% ab,]
+  if(nrow(gliph_sub) > 0){
+    index_vec <- unique(gliph_sub$index)
+    if(length(index_vec) > 1){
+      index_fmt <- paste(sort(index_vec),collapse = ":")
+      index_col[index_col %in% ab] <- index_fmt
+    } else{
+      index_col[index_col %in% ab] <- index_vec
+    }
+    
+  }
+}
+
+mab_table$gliph_group <- index_col
+```
+
+### c. Additional gliph results to add
+* hla_score 
+* final_score
+* type (global/local plus motif string)
+* Formatted HLA allele string
+```{r}
+target_cells <- mab_table[mab_table$CDR3ab_AA %in% gliph_resuls_csf$CRD3ab_AA,]
+target_cells <- unique(target_cells$igseq_barcode)
+
+# Initialize columns
+hlascore_col   <- mab_table$CDR3ab_AA
+finalscore_col <- mab_table$CDR3ab_AA
+type_col       <- mab_table$CDR3ab_AA
+
+names(hlascore_col)   <- mab_table$igseq_barcode
+names(finalscore_col) <- mab_table$igseq_barcode
+names(type_col)       <- mab_table$igseq_barcode
+
+hlascore_col[! names(hlascore_col) %in% target_cells]     <- ""
+finalscore_col[! names(finalscore_col) %in% target_cells] <- ""
+type_col[! names(type_col) %in% target_cells]             <- ""
+
+target_cdr3ab <- unique(as.character(hlascore_col[! hlascore_col %in% ""]))
+
+
+for (ab in target_cdr3ab) {
+  gliph_sub <- gliph_resuls_csf[gliph_resuls_csf$CRD3ab_AA %in% ab,]
+  if(nrow(gliph_sub) > 0){
+    hlascore   <- unique(gliph_sub$hla_score)
+    finalscore <- unique(gliph_sub$final_score)
+    type       <- unique(gliph_sub$type)
+    
+    if(length(hlascore) > 1)   {hlascore   <- paste(sort(hlascore),collapse = ":")}
+    if(length(finalscore) > 1) {finalscore <- paste(sort(finalscore),collapse = ":")}
+    if(length(type) > 1)       {type       <- paste(sort(type),collapse = ":")}
+    
+    # Insert values into new columns
+    hlascore_col[hlascore_col %in% ab]     <- hlascore
+    finalscore_col[finalscore_col %in% ab] <- finalscore
+    type_col[type_col %in% ab]             <- type
+    
+    
+  }
+}
+
+mab_table$gliph_hla_score   <- hlascore_col
+mab_table$gliph_final_score <- finalscore_col
+mab_table$gliph_motif_type  <- type_col
+```
+
+### d. create column of significant HLA allele results (incomplete)
+```{r}
+target_cells <- mab_table[mab_table$CDR3ab_AA %in% gliph_resuls_csf$CRD3ab_AA,]
+target_cells <- unique(target_cells$igseq_barcode)
+
+# Initialize columns
+hla_col        <- mab_table$CDR3ab_AA
+names(hla_col) <- mab_table$igseq_barcode
+hla_col[! names(hla_col) %in% target_cells]     <- ""
+
+target_cdr3ab <- unique(as.character(hla_col[! hla_col %in% ""]))
+for (ab in target_cdr3ab) {
+  gliph_sub <- gliph_resuls_csf[gliph_resuls_csf$CRD3ab_AA %in% ab,]
+  if(nrow(gliph_sub) > 1){
+    cat(paste0(ab,"\n"))
+  }
+  
+}
+
+
+```
+
+
+# 4. Write CSV
+```{r}
+write.csv(mab_table,file = "./tables/MERGED_GLIPH2_mtcr_table_ALL_TCR.v3.1.CLEAN.csv",quote = F,row.names = F)
+```
+
