@@ -1,0 +1,181 @@
+---
+title: "Create mTCR Candidate Table"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Purpose: generate comprehensive summary tables from Single cell data in order to select out candidate mTCRs
+
+```{r}
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+source("Resources/functions_sc_analysis.R")
+
+library(Seurat)
+library(knitr)
+library(reshape2)
+library(pheatmap)
+library(SingleR)
+library(kableExtra)
+library(devtools)
+library(dplyr)
+library(parallel)
+library(data.table)
+library(Matrix)
+# Volcano
+library(ggrepel)
+library(ggplot2)
+# Monocle 3
+library(monocle3)
+# Immcantation
+library(alakazam)
+library(scales)
+library(igraph)
+library(stringr)
+# Dendrogram
+library(stringdist)
+library(graphics)
+library(ggdendro)
+library(dendextend)
+
+```
+
+
+# 1.Load Object
+```{r}
+load("./objects/tcell_igseq_obj_PAIRS.RData")
+```
+
+### a. Update Meta Data
+```{r}
+tcr_metadata <- "./metadata/metadata.csv"
+pairs_csfpb5 <- addRNAseqMetaData(pairs_csfpb5_tcr,metadata_sheet = tcr_metadata)
+```
+
+### b. Add cellranger results
+
+### I. Add Immcantation Results
+
+##### a) All samples v3.1 
+```{r}
+igseq_results_all_fh <- "./tables/FORMATTED_immcantation_results_table.ALL.TCR.v3.1.csv"
+igseq_results_fmt <- read.csv(igseq_results_all_fh)
+
+
+## Add immcantation results to Seurat object
+pairs_csfpb5$cgene_imm[pairs_csfpb5$cgene_imm == ""] <- "Not Detected"
+```
+
+
+
+### II. key input v3.1
+```{r}
+mab_table_bencode_all <- "./tables/mtcr_table_ALL_TCR.v3.1.csv"
+
+# Add 'igseq_barcode' column to formatted table
+# Add cell barcode column [cell]-[igseq sample]
+cells <- tstrsplit(igseq_results_fmt$cell_barcode_fmt,"-")[[1]]
+igseq_results_fmt$igseq_barcode <- paste(cells,igseq_results_fmt$sample_igseq)
+igseq_results_fmt$igseq_barcode <- str_replace_all(igseq_results_fmt$igseq_barcode,"\\ ","-")
+# Add 'loc' column
+csf_pb_vec <- as.character(igseq_results_fmt$sample_igseq)
+csf_cells  <- csf_pb_vec[grep("CSF",csf_pb_vec)]
+csf_pb_vec[csf_pb_vec %in% csf_cells]  <- "CSF"
+csf_pb_vec[! csf_pb_vec %in% c("CSF")] <- "PB"
+igseq_results_fmt$loc <- csf_pb_vec
+```
+
+# 2. Remove entries with 1 chain
+```{r}
+freq_chain_counts <- as.data.frame(table(paste(igseq_results_fmt$chain_count,igseq_results_fmt$chain)))
+igseq_results_fmt <- igseq_results_fmt[igseq_results_fmt$chain_count != 1,]
+```
+
+# 3 Add PaperID_Diagnosis_Loc column
+```{r}
+metadata_sheet = "./metadata/metadata.csv"
+metadata.df <- read.csv(metadata_sheet)
+igseq_col <- 3
+metadata.df <- metadata.df[! metadata.df[,igseq_col] %in% c("","n/a"),]
+
+paper_conv_vec <- metadata.df$Paper_ID_Diagnosis_loc
+names(paper_conv_vec) <- metadata.df[,igseq_col]
+
+new_col <- as.character(igseq_results_fmt$sample_igseq)
+
+for(s in as.character(unique(new_col))){
+  if (s %in% names(paper_conv_vec)){
+    new_col[new_col %in% s] <- as.character(paper_conv_vec[s])
+  } else{
+    new_col[new_col %in% s] <- ""
+  }
+}
+igseq_results_fmt$Paper_ID_Diagnosis_loc <- new_col
+```
+
+# 4. Add in SingleR annotations & clonotype ID (immcantation)
+
+#### --CSV - all mTCRs
+```{r}
+# Subset by entries with an immcantation clonotype ID
+igseq.results.df.fin <- igseq_results_fmt
+
+
+# Add annotation columns - BlueprintENCODE/Custom
+igseq.results.df.fin$subtype.cell.annot.bencode <- ""
+igseq.results.df.fin$subtype.cell.annot.manual  <- ""
+e <- grep("subtype.cell.annot.bencode",names(igseq.results.df.fin))
+c <- grep("subtype.cell.annot.manual",names(igseq.results.df.fin))
+new_col_encode <- rep("No Annot",nrow(igseq.results.df.fin))
+new_col_custom <- rep("No Annot",nrow(igseq.results.df.fin))
+names(new_col_encode) <- igseq.results.df.fin$igseq_barcode
+names(new_col_custom) <- igseq.results.df.fin$igseq_barcode
+
+annot_vec <- pairs_csfpb5$subtype.cell.annot.bencode
+annot_vec <- annot_vec[names(annot_vec) %in% igseq.results.df.fin$seurat_converted_cell_barcode]
+
+annot_vec_custom <- pairs_csfpb5$tcell_simple_annot
+annot_vec_custom <- annot_vec_custom[names(annot_vec_custom) %in% igseq.results.df.fin$seurat_converted_cell_barcode]
+
+
+igseq.sub.rnaseq <- igseq.results.df.fin[igseq.results.df.fin$seurat_converted_cell_barcode %in% names(annot_vec),]
+for (i in 1:nrow(igseq.sub.rnaseq)) {
+  igseq_row <- igseq.sub.rnaseq[i,]
+  seurat_barcode <- igseq_row$seurat_converted_cell_barcode
+  igseq_barcode  <- igseq_row$igseq_barcode
+  celltype_encode <- as.character(annot_vec[names(annot_vec) %in% seurat_barcode])
+  celltype_custom <- as.character(annot_vec_custom[names(annot_vec_custom) %in% seurat_barcode])
+  new_col_encode[names(new_col_encode) %in% igseq_barcode] <- celltype_encode
+  new_col_custom[names(new_col_custom) %in% igseq_barcode] <- celltype_custom
+}
+igseq.results.df.fin[,e] <- new_col_encode
+igseq.results.df.fin[,c] <- new_col_custom
+
+
+# Add annotation columns - Monaco
+igseq.results.df.fin$subtype.cell.annot.monaco <- ""
+m <- grep("subtype.cell.annot.monaco",names(igseq.results.df.fin))
+new_col_monaco <- rep("No Annot",nrow(igseq.results.df.fin))
+names(new_col_monaco) <- igseq.results.df.fin$igseq_barcode
+annot_vec <- pairs_csfpb5$subtype.cell.annot.monaco
+annot_vec <- annot_vec[names(annot_vec) %in% igseq.results.df.fin$seurat_converted_cell_barcode]
+
+
+igseq.sub.rnaseq <- igseq.results.df.fin[igseq.results.df.fin$seurat_converted_cell_barcode %in% names(annot_vec),]
+for (i in 1:nrow(igseq.sub.rnaseq)) {
+  igseq_row <- igseq.sub.rnaseq[i,]
+  seurat_barcode <- igseq_row$seurat_converted_cell_barcode
+  igseq_barcode  <- igseq_row$igseq_barcode
+  celltype_monaco <- as.character(annot_vec[names(annot_vec) %in% seurat_barcode])
+  new_col_monaco[names(new_col_monaco) %in% igseq_barcode] <- celltype_monaco
+}
+igseq.results.df.fin[,m] <- new_col_monaco
+
+
+
+write.csv(igseq.results.df.fin,file = mab_table_bencode_all,row.names = T,quote = F)
+
+```
