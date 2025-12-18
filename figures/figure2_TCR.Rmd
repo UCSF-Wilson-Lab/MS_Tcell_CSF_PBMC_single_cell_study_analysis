@@ -1,0 +1,664 @@
+---
+title: "Figure 2 TCR"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libs
+```{r}
+# Immcantation
+library(alakazam)
+library(shazam)
+library(tigger)
+library(dplyr)
+library(data.table)
+library(scales)
+library(igraph)
+library(devtools)
+library(pheatmap)
+library(RColorBrewer)
+library(ape)
+library(stringr)
+# Dedrogram stuff
+library(stringdist)
+library(graphics)
+library(ggdendro)
+library(dendextend)
+
+library(ggpubr)
+
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+source("Resources/functions_sc_analysis.R")
+
+plot_dir   <- "./plots_main/"
+dir.create(plot_dir,recursive = T)
+tables_dir <- "./tables/"
+dir.create(tables_dir,recursive = T)
+supp_dir   <- "./plots_supp/"
+dir.create(supp_dir,recursive = T)
+```
+
+# 1. Load TCR RNA-Seq Object
+```{r}
+library(Seurat)
+load("./objects/tcell_igseq_obj_PAIRS.RData")
+pairs_csfpb5_tcr <- UpdateSeuratObject(pairs_csfpb5_tcr)
+
+# Subset CD4 and CD8
+pairs_cd4 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD4 T cells")])]
+pairs_cd8 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD8 T cells")])]
+```
+
+
+# 1. Load immcantation result All Samples & meta data
+```{r}
+# ALL Ig-seq samples
+db.tra <- readChangeoDb("./immcantation_results_v3.1/10X_alpha-parse-FILTERED_germ-pass.final.tab")
+db.trb <- readChangeoDb("./immcantation_results_v3.1/10X_beta_clone-pass-FILTERED_germ-pass.final.tab")
+
+# Alpha and Beta entries
+db.all <- rbind(db.tra,db.trb)
+
+# Formatted table - with cell type annotations
+mab_table <- read.csv("./tables/mab_table_ALL_TCR.v3.1.CLEAN.csv",stringsAsFactors = F)
+mab_table <- mab_table[mab_table$chain_count != 1,]
+```
+
+# 2. Add useful cloumns
+
+### a. add useful columns
+* loc,sample,diagnositc category
+```{r}
+# Make a sample and loc columns
+sample_col <- tstrsplit(db.all$SEQUENCE_ID,":")[[1]]
+db.all$SAMPLE <- sample_col
+
+# Make a Patient Column
+patient_col <- tstrsplit(db.all$SAMPLE,"_")[[1]]
+db.all$PATIENT <- patient_col
+
+# loc column
+loc_vec <- db.all$SEQUENCE_ID
+loc_vec[grep("CSF", loc_vec)] <- "CSF"
+loc_vec[loc_vec != "CSF"] <- "PB"
+db.all$LOC <- loc_vec
+
+# Ig-Seq Barcode
+igseq_barcode <- tstrsplit(db.all$SEQUENCE_ID,"-")[[1]]
+igseq_sample  <- tstrsplit(igseq_barcode,":")[[1]]
+igseq_cell    <- tstrsplit(igseq_barcode,":")[[2]]
+igseq_barcode <- paste(igseq_cell, igseq_sample)
+igseq_barcode <- str_replace_all(igseq_barcode,"\\ ","-")
+db.all$igseq_barcode <- igseq_barcode
+
+# Add V/D/J Family Usage columns
+db.all$V_CALL_GENE <- tstrsplit(db.all$V_CALL,"\\*")[[1]]
+db.all$V_CALL_FAM  <- tstrsplit(db.all$V_CALL_GENE,"-")[[1]]
+db.all$J_CALL_GENE <- tstrsplit(db.all$J_CALL,"\\*")[[1]]
+db.all$J_CALL_FAM  <- tstrsplit(db.all$J_CALL,"\\*")[[1]]
+db.all$D_CALL_GENE <- tstrsplit(db.all$D_CALL,"\\*")[[1]]
+db.all$D_CALL_FAM  <- tstrsplit(db.all$D_CALL_GENE,"-")[[1]]
+
+```
+
+
+### b. OMIT cells with 1 chain
+```{r}
+multi_chain_cells <- as.character(unique(mab_table$igseq_barcode))
+db.all <- db.all[db.all$igseq_barcode %in% multi_chain_cells,]
+```
+
+### c. remove cells if there is an NA at the LOCUS level (TRA or TRB)
+```{r}
+chains <- unique(db.all$LOCUS[!is.na(db.all$LOCUS)])
+db.all <- db.all[db.all$LOCUS %in% chains,]
+```
+
+### d. add merged clonotype IDs
+```{r}
+db.all$CLONE_ORIGINAL <- db.all$CLONE
+orig_clonotypes <- db.all$CLONE
+names(orig_clonotypes) <- db.all$igseq_barcode
+
+# merged clonotypes (should be the same)
+merged_clonotypes <- as.character(mab_table$MERGED_clonotypeID_imm)
+names(merged_clonotypes) <- as.character(mab_table$igseq_barcode)
+
+new_clone_col <- orig_clonotypes
+
+for (cell in unique(names(orig_clonotypes))) {
+  combined_clonotype <- as.character(merged_clonotypes[cell])
+  new_clone_col[names(new_clone_col) %in% cell] <- combined_clonotype
+}
+
+db.all$CLONE <- new_clone_col
+```
+
+
+### e. add PaperID_Diagnosis_Loc column,Diagnosis,PaperID
+```{r}
+metadata_sheet = "./metadata/metadata.csv"
+metadata.df <- read.csv(metadata_sheet)
+metadata.df <- metadata.df[! metadata.df$TCR_Sample %in% c("","n/a"),]
+
+paper_conv_vec <- as.character(metadata.df$Paper_ID_Diagnosis_loc)
+names(paper_conv_vec) <- as.character(metadata.df$TCR_Sample)
+
+new_col <- db.all$SAMPLE
+
+for(s in as.character(unique(new_col))){
+  if (s %in% names(paper_conv_vec)){
+    new_col[new_col %in% s] <- as.character(paper_conv_vec[s])
+  } else{
+    new_col[new_col %in% s] <- ""
+  }
+}
+db.all$Paper_ID_Diagnosis_loc <- new_col
+
+## Diagnosis column
+db.all$Diagnosis <- tstrsplit(db.all$Paper_ID_Diagnosis_loc,"_")[[2]]
+
+
+```
+
+
+### f. Add CD4/CD8 annotation
+
+#### --simple CD4/CD8 Annotations
+```{r}
+mab_table_cd4 <- mab_table[mab_table$seurat_converted_cell_barcode %in% colnames(pairs_cd4),]
+mab_table_cd8 <- mab_table[mab_table$seurat_converted_cell_barcode %in% colnames(pairs_cd8),]
+
+new_annot_col<- rep("No Annot",length(db.all$igseq_barcode))
+names(new_annot_col) <- db.all$igseq_barcode
+new_annot_col[names(new_annot_col) %in% as.character(unique(mab_table_cd4$igseq_barcode))] <- "CD4 T cells"
+new_annot_col[names(new_annot_col) %in% as.character(unique(mab_table_cd8$igseq_barcode))] <- "CD8 T cells"
+
+db.all$tcell_simple_annot <- new_annot_col
+```
+
+
+### g. Add simple Diagnosis Column
+
+```{r}
+simple_diagnosis_vec <- db.all$Diagnosis
+# MS
+simple_diagnosis_vec[simple_diagnosis_vec %in% c("RRMS","CIS")] <- "MS"
+# OND
+simple_diagnosis_vec[simple_diagnosis_vec %in% c("Neurosarcoidosis","NMO","Uveitis")] <- "OND"
+
+db.all$Diagnosis_simple <- simple_diagnosis_vec
+
+# add clone_id column so plot commands work
+db.all$clone_id <- db.all$CLONE
+```
+
+### g. subset MS, HC, OND
+```{r}
+db_ms   <- db.all[db.all$Diagnosis %in% c("RRMS","CIS"),]
+db_hc   <- db.all[db.all$Diagnosis %in% c("HC"),]
+db_ond  <- db.all[db.all$Diagnosis %in% c("Neurosarcoidosis","NMO","Uveitis"),] 
+```
+
+### h. subset PB and CSF
+```{r}
+# Everything
+db.all.csf <- db.all[db.all$LOC == "CSF",]
+db.all.pb  <- db.all[db.all$LOC == "PB",]
+
+# MS
+db_ms_csf <- db_ms[db_ms$LOC == "CSF",]
+db_ms_pb  <- db_ms[db_ms$LOC == "PB",]
+
+# HC
+db_hc_csf <- db_hc[db_hc$LOC == "CSF",]
+db_hc_pb  <- db_hc[db_hc$LOC == "PB",]
+
+# OND
+db_ond_csf <- db_ond[db_ond$LOC == "CSF",]
+db_ond_pb  <- db_ond[db_ond$LOC == "PB",]
+```
+
+# ----------------------------
+
+# 3. CD4 Diversity per Diagnosis
+
+### a. CSF
+```{r}
+db.sub <-  db.all.csf[db.all.csf$tcell_simple_annot %in% c("CD4 T cells"),]
+db.sub$Diagnosis_simple[db.sub$Diagnosis_simple %in% c("HC","OND")] <- "Control"
+
+rank_curve_diag  <- estimateAbundance(db.sub, group="Diagnosis_simple", ci=0.95, nboot=200)
+r <-plot(rank_curve_diag,main_title="CSF CD4 Rank diversity Diagnosis")
+
+# Plot one measure at a time  Shanon Div. = 1, Simpson Div. = 2
+MIN_OBS <- 30 # default = 30
+NBOOT   <- 200
+alpha_curve_diag <- alphaDiversity(db.sub, group="Diagnosis_simple",min_q=0, max_q=4, step_q=0.1,ci=0.95, nboot=NBOOT,min_n=MIN_OBS)
+a <-plot(alpha_curve_diag,main_title="CSF CD4 alpha diversity Diagnosis")
+shannon <- plot(alpha_curve_diag, 1, main_title="CSF CD4 Shanon diversity Diagnosis", legend_title="Diagnosis")
+
+# Get table of shannon diversity values
+table_diversity_fig2b_cd4_csf   <- alpha_curve_diag@diversity
+table_shannon_div_fig2b_cd4_csf <- shannon$data
+
+# >> PDFs
+pdf(file = paste0(plot_dir,"fig2b_CD4_CSF_Diagnosis.rankDiv.pdf"))
+r
+dev.off()
+
+pdf(file = paste0(plot_dir,"fig2b_CD4_CSF_Diagnosis.shannonDiv.pdf"))
+shannon
+dev.off()
+
+# Output shannon diversity values
+write.csv(table_diversity_fig2b_cd4_csf,file = paste0(tables_dir,"fig2b_CD4_CSF_Diagnosis.shannonDiv.csv"),quote = F,row.names = F)
+```
+
+### b. PB
+```{r}
+db.sub <-  db.all.pb[db.all.pb$tcell_simple_annot %in% c("CD4 T cells"),]
+db.sub$Diagnosis_simple[db.sub$Diagnosis_simple %in% c("HC","OND")] <- "Control"
+
+rank_curve_diag  <- estimateAbundance(db.sub, group="Diagnosis_simple", ci=0.95, nboot=200)
+r <-plot(rank_curve_diag,main_title="PB CD4 Rank diversity Diagnosis")
+
+# Plot one measure at a time  Shanon Div. = 1, Simpson Div. = 2
+MIN_OBS <- 30 # default = 30
+NBOOT   <- 200
+alpha_curve_diag <- alphaDiversity(db.sub, group="Diagnosis_simple",min_q=0, max_q=4, step_q=0.1,ci=0.95, nboot=NBOOT,min_n=MIN_OBS)
+a <-plot(alpha_curve_diag,main_title="PB CD4 alpha diversity Diagnosis")
+shannon <- plot(alpha_curve_diag, 1, main_title="PB CD4 Shanon diversity Diagnosis", legend_title="Diagnosis")
+
+# Get table of shannon diversity values
+table_diversity_fig2b_cd4_pb <- alpha_curve_diag@diversity
+
+# >> PDFs
+pdf(file = paste0(plot_dir,"fig2b_CD4_PB_Diagnosis.rankDiv.pdf"))
+r
+dev.off()
+
+pdf(file = paste0(plot_dir,"fig2b_CD4_PB_Diagnosis.shannonDiv.pdf"))
+shannon
+dev.off()
+
+# Output shannon diversity values
+write.csv(table_diversity_fig2b_cd4_pb,file = paste0(tables_dir,"fig2b_CD4_PB_Diagnosis.shannonDiv.csv"),quote = F,row.names = F)
+```
+
+
+# 4. CD8 Diversity per Diagnosis
+
+### a. CSF
+```{r}
+db.sub <-  db.all.csf[db.all.csf$tcell_simple_annot %in% c("CD8 T cells"),]
+db.sub$Diagnosis_simple[db.sub$Diagnosis_simple %in% c("HC","OND")] <- "Control"
+
+rank_curve_diag  <- estimateAbundance(db.sub, group="Diagnosis_simple", ci=0.95, nboot=200)
+r <-plot(rank_curve_diag,main_title="CSF CD8 Rank diversity Diagnosis")
+
+# Plot one measure at a time  Shanon Div. = 1, Simpson Div. = 2
+MIN_OBS <- 30 # default = 30
+NBOOT   <- 200
+alpha_curve_diag <- alphaDiversity(db.sub, group="Diagnosis_simple",min_q=0, max_q=4, step_q=0.1,ci=0.95, nboot=NBOOT,min_n=MIN_OBS)
+a <-plot(alpha_curve_diag,main_title="CSF CD8 alpha diversity Diagnosis")
+shannon <- plot(alpha_curve_diag, 1, main_title="CSF CD8 Shanon diversity Diagnosis", legend_title="Diagnosis")
+
+# Get table of shannon diversity values
+table_diversity_fig2b_cd8_csf <- alpha_curve_diag@diversity
+
+# >> PDFs
+pdf(file = paste0(plot_dir,"fig2c_CD8_CSF_Diagnosis.rankDiv.pdf"))
+r
+dev.off()
+
+pdf(file = paste0(plot_dir,"fig2c_CD8_CSF_Diagnosis.shannonDiv.pdf"))
+shannon
+dev.off()
+
+# Output shannon diversity values
+write.csv(table_diversity_fig2b_cd8_csf,file = paste0(tables_dir,"fig2b_CD8_CSF_Diagnosis.shannonDiv.csv"),quote = F,row.names = F)
+```
+
+### b. PB
+```{r}
+db.sub <-  db.all.pb[db.all.pb$tcell_simple_annot %in% c("CD8 T cells"),]
+db.sub$Diagnosis_simple[db.sub$Diagnosis_simple %in% c("HC","OND")] <- "Control"
+
+rank_curve_diag  <- estimateAbundance(db.sub, group="Diagnosis_simple", ci=0.95, nboot=200)
+r <-plot(rank_curve_diag,main_title="PB CD8 Rank diversity Diagnosis")
+
+# Plot one measure at a time  Shanon Div. = 1, Simpson Div. = 2
+MIN_OBS <- 30 # default = 30
+NBOOT   <- 200
+alpha_curve_diag <- alphaDiversity(db.sub, group="Diagnosis_simple",min_q=0, max_q=4, step_q=0.1,ci=0.95, nboot=NBOOT,min_n=MIN_OBS)
+a <-plot(alpha_curve_diag,main_title="PB CD8 alpha diversity Diagnosis")
+shannon <- plot(alpha_curve_diag, 1, main_title="PB CD8 Shanon diversity Diagnosis", legend_title="Diagnosis")
+
+# Get table of shannon diversity values
+table_diversity_fig2b_cd8_pb <- alpha_curve_diag@diversity
+
+# >> PDFs
+pdf(file = paste0(plot_dir,"fig2c_CD8_PB_Diagnosis.rankDiv.pdf"))
+r
+dev.off()
+
+pdf(file = paste0(plot_dir,"fig2c_CD8_PB_Diagnosis.shannonDiv.pdf"))
+shannon
+dev.off()
+
+# Output shannon diversity values
+write.csv(table_diversity_fig2b_cd8_pb,file = paste0(tables_dir,"fig2b_CD8_PB_Diagnosis.shannonDiv.csv"),quote = F,row.names = F)
+```
+
+
+# ----------------------------
+
+# 5. VDJ Usage Tables
+```{r}
+v_dir <- paste0(supp_dir,"Vusage/")
+j_dir <- paste0(supp_dir,"Jusage/")
+dir.create(v_dir,recursive = T)
+dir.create(j_dir,recursive = T)
+```
+
+## --Set row.names
+```{r}
+USAGE_CATEG <- "Paper_ID_Diagnosis_loc"
+```
+
+## --ALL samples - RAW counts
+### a. V usage - gene
+```{r}
+## CSF
+csf_v_read_count <- create_VJC_usage_matrix(db.all.csf,mode = "read",usage = "V_CALL_GENE",patient = USAGE_CATEG,norm=F)
+csf_v_cell_count  <- create_VJC_usage_matrix(db.all.csf,mode = "cell",usage = "V_CALL_GENE",patient = USAGE_CATEG,norm=F)
+
+## PB
+pb_v_read_count <- create_VJC_usage_matrix(db.all.pb,mode = "read",usage = "V_CALL_GENE",patient = USAGE_CATEG,norm=F)
+pb_v_cell_count  <- create_VJC_usage_matrix(db.all.pb,mode = "cell",usage = "V_CALL_GENE",patient = USAGE_CATEG,norm=F)
+
+# Create unified row and col order
+# Patients
+patient_order_csf <- sort(row.names(csf_v_read_count))
+patient_order_pb <- sort(row.names(pb_v_read_count))
+# Genes
+all_csf_vgenes <- sort(colnames(csf_v_read_count))
+all_pb_vgenes  <- sort(colnames(pb_v_read_count))
+overlap_vgenes <- all_csf_vgenes[all_csf_vgenes %in% all_pb_vgenes]
+
+
+## Format Read count matrix
+csf_v_read_count <- csf_v_read_count[patient_order_csf,]
+csf_v_read_count <- csf_v_read_count[,overlap_vgenes]
+pb_v_read_count <- pb_v_read_count[patient_order_pb,]
+pb_v_read_count <- pb_v_read_count[,overlap_vgenes]
+v_raw_read_count_mtx <- rbind(pb_v_read_count,csf_v_read_count)
+
+write.csv(v_raw_read_count_mtx,file = paste0(v_dir,"Vusage_gene_readcount.ALL.csv"),quote = F)
+
+## Format Cell count matrix 
+csf_v_cell_count <- csf_v_cell_count[patient_order_csf,]
+csf_v_cell_count <- csf_v_cell_count[,overlap_vgenes]
+pb_v_cell_count <- pb_v_cell_count[patient_order_pb,]
+pb_v_cell_count <- pb_v_cell_count[,overlap_vgenes]
+v_raw_cell_count_mtx <- rbind(pb_v_cell_count,csf_v_cell_count)
+
+write.csv(v_raw_cell_count_mtx,file = paste0(v_dir,"Vusage_gene_cellcount.ALL.csv"),quote = F)
+```
+
+
+
+### b. V usage - family
+```{r}
+## CSF
+csf_v_read_count <- create_VJC_usage_matrix(db.all.csf,mode = "read",usage = "V_CALL_FAM",patient = USAGE_CATEG,norm=F)
+csf_v_cell_count  <- create_VJC_usage_matrix(db.all.csf,mode = "cell",usage = "V_CALL_FAM",patient = USAGE_CATEG,norm=F)
+
+## PB
+pb_v_read_count <- create_VJC_usage_matrix(db.all.pb,mode = "read",usage = "V_CALL_FAM",patient = USAGE_CATEG,norm=F)
+pb_v_cell_count  <- create_VJC_usage_matrix(db.all.pb,mode = "cell",usage = "V_CALL_FAM",patient = USAGE_CATEG,norm=F)
+
+# Create unified row and col order
+# Patients
+patient_order_csf <- sort(row.names(csf_v_read_count))
+patient_order_pb <- sort(row.names(pb_v_read_count))
+# Genes
+all_csf_vgenes <- sort(colnames(csf_v_read_count))
+all_pb_vgenes  <- sort(colnames(pb_v_read_count))
+overlap_vgenes <- all_csf_vgenes[all_csf_vgenes %in% all_pb_vgenes]
+
+
+## Format Read count matrix
+csf_v_read_count <- csf_v_read_count[patient_order_csf,]
+csf_v_read_count <- csf_v_read_count[,overlap_vgenes]
+pb_v_read_count <- pb_v_read_count[patient_order_pb,]
+pb_v_read_count <- pb_v_read_count[,overlap_vgenes]
+v_raw_read_count_mtx <- rbind(pb_v_read_count,csf_v_read_count)
+
+write.csv(v_raw_read_count_mtx,file = paste0(v_dir,"Vusage_family_readcount.ALL.csv"),quote = F)
+
+## Format Cell count matrix 
+csf_v_cell_count <- csf_v_cell_count[patient_order_csf,]
+csf_v_cell_count <- csf_v_cell_count[,overlap_vgenes]
+pb_v_cell_count <- pb_v_cell_count[patient_order_pb,]
+pb_v_cell_count <- pb_v_cell_count[,overlap_vgenes]
+v_raw_cell_count_mtx <- rbind(pb_v_cell_count,csf_v_cell_count)
+
+write.csv(v_raw_cell_count_mtx,file = paste0(v_dir,"Vusage_family_cellcount.ALL.csv"),quote = F)
+```
+
+### c. J usage - gene
+```{r}
+## CSF
+csf_j_read_count <- create_VJC_usage_matrix(db.all.csf,mode = "read",usage = "J_CALL_GENE",patient = USAGE_CATEG,norm=F)
+csf_j_cell_count  <- create_VJC_usage_matrix(db.all.csf,mode = "cell",usage = "J_CALL_GENE",patient = USAGE_CATEG,norm=F)
+
+## PB
+pb_j_read_count <- create_VJC_usage_matrix(db.all.pb,mode = "read",usage = "J_CALL_GENE",patient = USAGE_CATEG,norm=F)
+pb_j_cell_count  <- create_VJC_usage_matrix(db.all.pb,mode = "cell",usage = "J_CALL_GENE",patient = USAGE_CATEG,norm=F)
+
+# Create unified row and col order
+# Patients
+patient_order_csf <- sort(row.names(csf_j_read_count))
+patient_order_pb <- sort(row.names(pb_j_read_count))
+# Genes
+all_csf_jgenes <- sort(colnames(csf_j_read_count))
+all_pb_jgenes  <- sort(colnames(pb_j_read_count))
+overlap_jgenes <- all_csf_jgenes[all_csf_jgenes %in% all_pb_jgenes]
+
+
+## Format Read count matrix
+csf_j_read_count <- csf_j_read_count[patient_order_csf,]
+csf_j_read_count <- csf_j_read_count[,overlap_jgenes]
+pb_j_read_count <- pb_j_read_count[patient_order_pb,]
+pb_j_read_count <- pb_j_read_count[,overlap_jgenes]
+j_raw_read_count_mtx <- rbind(pb_j_read_count,csf_j_read_count)
+
+write.csv(j_raw_read_count_mtx,file = paste0(j_dir,"Jusage_gene_readcount.ALL.csv"),quote = F)
+
+## Format Cell count matrix 
+csf_j_cell_count <- csf_j_cell_count[patient_order_csf,]
+csf_j_cell_count <- csf_j_cell_count[,overlap_jgenes]
+pb_j_cell_count <- pb_j_cell_count[patient_order_pb,]
+pb_j_cell_count <- pb_j_cell_count[,overlap_jgenes]
+j_raw_cell_count_mtx <- rbind(pb_j_cell_count,csf_j_cell_count)
+
+write.csv(j_raw_cell_count_mtx,file = paste0(j_dir,"Jusage_gene_cellcount.ALL.csv"),quote = F)
+```
+
+### d. J usage - family
+```{r}
+## CSF
+csf_j_read_count <- create_VJC_usage_matrix(db.all.csf,mode = "read",usage = "J_CALL_FAM",patient = USAGE_CATEG,norm=F)
+csf_j_cell_count  <- create_VJC_usage_matrix(db.all.csf,mode = "cell",usage = "J_CALL_FAM",patient = USAGE_CATEG,norm=F)
+
+## PB
+pb_j_read_count <- create_VJC_usage_matrix(db.all.pb,mode = "read",usage = "J_CALL_FAM",patient = USAGE_CATEG,norm=F)
+pb_j_cell_count  <- create_VJC_usage_matrix(db.all.pb,mode = "cell",usage = "J_CALL_FAM",patient = USAGE_CATEG,norm=F)
+
+# Create unified row and col order
+# Patients
+patient_order_csf <- sort(row.names(csf_j_read_count))
+patient_order_pb  <- sort(row.names(pb_j_read_count))
+# Genes
+all_csf_jgenes <- sort(colnames(csf_j_read_count))
+all_pb_jgenes  <- sort(colnames(pb_j_read_count))
+overlap_jgenes <- all_csf_jgenes[all_csf_jgenes %in% all_pb_jgenes]
+
+
+## Format Read count matrix
+csf_j_read_count <- csf_j_read_count[patient_order_csf,]
+csf_j_read_count <- csf_j_read_count[,overlap_jgenes]
+pb_j_read_count <- pb_j_read_count[patient_order_pb,]
+pb_j_read_count <- pb_j_read_count[,overlap_jgenes]
+j_raw_read_count_mtx <- rbind(pb_j_read_count,csf_j_read_count)
+
+write.csv(j_raw_read_count_mtx,file = paste0(j_dir,"Jusage_family_readcount.ALL.csv"),quote = F)
+
+## Format Cell count matrix 
+csf_j_cell_count <- csf_j_cell_count[patient_order_csf,]
+csf_j_cell_count <- csf_j_cell_count[,overlap_jgenes]
+pb_j_cell_count <- pb_j_cell_count[patient_order_pb,]
+pb_j_cell_count <- pb_j_cell_count[,overlap_jgenes]
+j_raw_cell_count_mtx <- rbind(pb_j_cell_count,csf_j_cell_count)
+
+write.csv(j_raw_cell_count_mtx,file = paste0(j_dir,"Jusage_family_cellcount.ALL.csv"),quote = F)
+```
+
+
+
+# ----------------------------
+
+# 6. Clonotype pie chart summary numbers
+```{r}
+mab_table_str <- mab_table
+```
+
+
+## -Add Expansion Status Column
+```{r}
+# Load Clonotype Counts
+clonotype_counts_fh <- "./tables/patient_clonotype_pcts/ALL_PATIENTS_clonotype_counts.csv"
+
+clonotype_counts <- read.csv(clonotype_counts_fh,row.names = 1)
+```
+
+```{r}
+clone_categ_vec <- mab_table_str$MERGED_clonotypeID_imm
+
+# Define Highly expanded clones
+HIGH_THRESH = 0.75
+high_exp        <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH,]
+high_exp_clones <- unique(row.names(high_exp))
+nonexp          <- clonotype_counts[clonotype_counts$cell_count == 1,]
+nonexp_clones   <- unique(row.names(nonexp))
+
+clone_categ_vec[clone_categ_vec %in% high_exp_clones] <- "High"
+clone_categ_vec[clone_categ_vec %in% nonexp_clones]   <- "Non-expanded"
+clone_categ_vec[! clone_categ_vec %in% c("Non-expanded","High")] <- "Moderate" 
+
+mab_table_str$clonotype_expansion_categ     <- clone_categ_vec
+```
+
+
+### --subset mab table by Diagnostic Category
+```{r}
+ms_pts <- unique(db_ms$PATIENT)
+hc_pts   <- unique(db_hc$PATIENT)
+ond_pts  <- unique(db_ond$PATIENT)
+
+mab_table_ms   <- mab_table_str[mab_table_str$Patient_ID %in% ms_pts,]
+mab_table_hc   <- mab_table_str[mab_table_str$Patient_ID %in% hc_pts,]
+mab_table_ond  <- mab_table_str[mab_table_str$Patient_ID %in% ond_pts,]
+```
+
+### --subset CD4/CD8 
+
+```{r}
+# MS
+mab_table_ms_cd4 <- mab_table_ms[mab_table_ms$seurat_converted_cell_barcode %in% colnames(pairs_cd4),]
+mab_table_ms_cd8 <- mab_table_ms[mab_table_ms$seurat_converted_cell_barcode %in% colnames(pairs_cd8),]
+
+# HC
+mab_table_hc_cd4 <- mab_table_hc[mab_table_hc$seurat_converted_cell_barcode %in% colnames(pairs_cd4),]
+mab_table_hc_cd8 <- mab_table_hc[mab_table_hc$seurat_converted_cell_barcode %in% colnames(pairs_cd8),]
+
+# OND
+mab_table_ond_cd4 <- mab_table_ond[mab_table_ond$seurat_converted_cell_barcode %in% colnames(pairs_cd4),]
+mab_table_ond_cd8 <- mab_table_ond[mab_table_ond$seurat_converted_cell_barcode %in% colnames(pairs_cd8),]
+```
+
+### --Function Pie chart numbers
+```{r}
+# Function returns a column of counts based on a set of clonal expansion categories
+#  - should input some subset of the mTCR table (MS only)
+pieChartStatsTCR <- function(mab_table_sub, count_col = "clonotype_cell_count_imm", expansion_col = "clonotype_expansion_categ") {
+
+  clone_count_sub <- mab_table_sub[,c("MERGED_clonotypeID_imm",count_col,expansion_col)]
+  clone_count_sub <- clone_count_sub[! duplicated(clone_count_sub),]
+  
+  
+  cell_count_results <- as.numeric(clone_count_sub[,grep(count_col,names(clone_count_sub))])
+  expansion_categ_results <- clone_count_sub[,grep(expansion_col,names(clone_count_sub))]
+  
+  piechart <- aggregate(cell_count_results,by=list(Category=expansion_categ_results), FUN=sum)
+  
+  row.names(piechart) <- piechart$Category
+  piechart$Category   <- NULL
+  
+  # Currently there are 3 expansion categories: Non-expanded, Moderate and High
+  piechart_fin <- data.frame(matrix(nrow = 3,ncol = 1))
+  names(piechart_fin)     <- c("count")
+  row.names(piechart_fin) <- c("Non-expanded","Moderate","High")
+  piechart_fin$count <- 0
+  
+  for (categ in row.names(piechart)) {
+    count <- as.numeric(piechart[categ,])
+    piechart_fin[categ,] <- count
+  }
+  
+  
+  return(piechart_fin)
+}
+```
+
+
+### a. CD4 CSF only
+```{r}
+mab_table_ms_csf  <- mab_table_ms_cd4[mab_table_ms_cd4$loc %in% c("CSF"),]
+mab_table_hc_csf  <- mab_table_hc_cd4[mab_table_hc_cd4$loc %in% c("CSF"),]
+mab_table_ond_csf <- mab_table_ond_cd4[mab_table_ond_cd4$loc %in% c("CSF"),]
+
+piechart_ms_csf  <- pieChartStatsTCR(mab_table_ms_csf,count_col = "clonotype_CSF_cell_count_imm") 
+piechart_hc_csf  <- pieChartStatsTCR(mab_table_hc_csf,count_col = "clonotype_CSF_cell_count_imm") 
+piechart_ond_csf <- pieChartStatsTCR(mab_table_ond_csf,count_col = "clonotype_CSF_cell_count_imm") 
+
+cd4_csf_piechart <- cbind(piechart_ms_csf,piechart_hc_csf,piechart_ond_csf)
+names(cd4_csf_piechart) <- c("MS_CD4_CSF","HC_CD4_CSF","OND_CD4_CSF")
+
+### >>> CSV
+write.csv(cd4_csf_piechart,file = paste0(tables_dir,"piechart_diagnosis_CD4_CSF.csv"),quote = F)
+```
+
+### b. CD8 CSF only
+```{r}
+mab_table_ms_csf  <- mab_table_ms_cd8[mab_table_ms_cd8$loc %in% c("CSF"),]
+mab_table_hc_csf  <- mab_table_hc_cd8[mab_table_hc_cd8$loc %in% c("CSF"),]
+mab_table_ond_csf <- mab_table_ond_cd8[mab_table_ond_cd8$loc %in% c("CSF"),]
+
+piechart_ms_csf  <- pieChartStatsTCR(mab_table_ms_csf,count_col = "clonotype_CSF_cell_count_imm") 
+piechart_hc_csf  <- pieChartStatsTCR(mab_table_hc_csf,count_col = "clonotype_CSF_cell_count_imm") 
+piechart_ond_csf <- pieChartStatsTCR(mab_table_ond_csf,count_col = "clonotype_CSF_cell_count_imm") 
+
+cd8_csf_piechart <- cbind(piechart_ms_csf,piechart_hc_csf,piechart_ond_csf)
+names(cd8_csf_piechart) <- c("MS_CD8_CSF","HC_CD8_CSF","OND_CD8_CSF")
+
+### >>> CSV
+write.csv(cd8_csf_piechart,file = paste0(tables_dir,"piechart_diagnosis_CD8_CSF.csv"),quote = F)
+```
+
