@@ -1,0 +1,538 @@
+---
+title: "Figure 2 CSF plots"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libs
+```{r}
+library(Seurat)
+# Immcantation
+library(alakazam)
+library(shazam)
+library(tigger)
+library(dplyr)
+library(data.table)
+library(scales)
+library(igraph)
+library(devtools)
+library(pheatmap)
+library(RColorBrewer)
+library(ape)
+library(stringr)
+# Dedrogram stuff
+library(stringdist)
+library(graphics)
+library(ggdendro)
+library(dendextend)
+library(dittoSeq)
+
+library(ggpubr)
+library(gridExtra)
+
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+source("Resources/functions_sc_analysis.R")
+
+plot_dir   <- "./plots_main/"
+dir.create(plot_dir,recursive = T)
+```
+
+
+# 1. Load TCR RNA-Seq Object
+```{r}
+load("./objects/tcell_igseq_obj_PAIRS.RData")
+
+# Subset CD4 and CD8
+pairs_cd4 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD4 T cells")])]
+pairs_cd8 <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$tcell_simple_annot[pairs_csfpb5_tcr$tcell_simple_annot %in% c("CD8 T cells")])]
+```
+
+
+# 1. Load immcantation result All Samples & meta data
+```{r}
+# ALL Ig-seq samples
+db.tra <- readChangeoDb("./immcantation_results_v3.1/10X_alpha-parse-FILTERED_germ-pass.final.tab")
+db.trb <- readChangeoDb("./immcantation_results_v3.1/10X_beta_clone-pass-FILTERED_germ-pass.final.tab")
+
+# Alpha and Beta entries
+db.all <- rbind(db.tra,db.trb)
+
+# Formatted table - with cell type annotations
+mab_table <- read.csv("./tables/mab_table_ALL_TCR.v3.1.CLEAN.csv",stringsAsFactors = F)
+mab_table <- mab_table[mab_table$chain_count != 1,]
+```
+
+# 2. Add useful cloumns
+
+### a. add useful columns
+```{r}
+# Make a sample and loc columns
+sample_col <- tstrsplit(db.all$SEQUENCE_ID,":")[[1]]
+db.all$SAMPLE <- sample_col
+
+# Make a Patient Column
+patient_col <- tstrsplit(db.all$SAMPLE,"_")[[1]]
+db.all$PATIENT <- patient_col
+
+# loc column
+loc_vec <- db.all$SEQUENCE_ID
+loc_vec[grep("CSF", loc_vec)] <- "CSF"
+loc_vec[loc_vec != "CSF"] <- "PB"
+db.all$LOC <- loc_vec
+
+# Ig-Seq Barcode
+igseq_barcode <- tstrsplit(db.all$SEQUENCE_ID,"-")[[1]]
+igseq_sample  <- tstrsplit(igseq_barcode,":")[[1]]
+igseq_cell    <- tstrsplit(igseq_barcode,":")[[2]]
+igseq_barcode <- paste(igseq_cell, igseq_sample)
+igseq_barcode <- str_replace_all(igseq_barcode,"\\ ","-")
+db.all$igseq_barcode <- igseq_barcode
+
+# Add V/D/J Family Usage columns
+db.all$V_CALL_GENE <- tstrsplit(db.all$V_CALL,"\\*")[[1]]
+db.all$V_CALL_FAM  <- tstrsplit(db.all$V_CALL_GENE,"-")[[1]]
+db.all$J_CALL_GENE <- tstrsplit(db.all$J_CALL,"\\*")[[1]]
+db.all$J_CALL_FAM  <- tstrsplit(db.all$J_CALL,"\\*")[[1]]
+db.all$D_CALL_GENE <- tstrsplit(db.all$D_CALL,"\\*")[[1]]
+db.all$D_CALL_FAM  <- tstrsplit(db.all$D_CALL_GENE,"-")[[1]]
+
+```
+
+
+### b. OMIT cells with 1 chain
+```{r}
+multi_chain_cells <- as.character(unique(mab_table$igseq_barcode))
+db.all <- db.all[db.all$igseq_barcode %in% multi_chain_cells,]
+```
+
+### c. remove cells if there is an NA at the LOCUS level (TRA or TRB)
+```{r}
+chains <- unique(db.all$LOCUS[!is.na(db.all$LOCUS)])
+db.all <- db.all[db.all$LOCUS %in% chains,]
+```
+
+### d. add merged clonotype IDs
+```{r}
+db.all$CLONE_ORIGINAL <- db.all$CLONE
+orig_clonotypes <- db.all$CLONE
+names(orig_clonotypes) <- db.all$igseq_barcode
+
+# merged clonotypes (should be the same)
+merged_clonotypes <- as.character(mab_table$MERGED_clonotypeID_imm)
+names(merged_clonotypes) <- as.character(mab_table$igseq_barcode)
+
+new_clone_col <- orig_clonotypes
+
+for (cell in unique(names(orig_clonotypes))) {
+  combined_clonotype <- as.character(merged_clonotypes[cell])
+  new_clone_col[names(new_clone_col) %in% cell] <- combined_clonotype
+}
+
+db.all$CLONE <- new_clone_col
+```
+
+
+### e. add PaperID_Diagnosis_Loc column,Diagnosis,PaperID
+```{r}
+metadata_sheet = "./metadata/metadata.csv"
+metadata.df <- read.csv(metadata_sheet)
+metadata.df <- metadata.df[! metadata.df$TCR_Sample %in% c("","n/a"),]
+
+paper_conv_vec <- as.character(metadata.df$Paper_ID_Diagnosis_loc)
+names(paper_conv_vec) <- as.character(metadata.df$TCR_Sample)
+
+new_col <- db.all$SAMPLE
+
+for(s in as.character(unique(new_col))){
+  if (s %in% names(paper_conv_vec)){
+    new_col[new_col %in% s] <- as.character(paper_conv_vec[s])
+  } else{
+    new_col[new_col %in% s] <- ""
+  }
+}
+db.all$Paper_ID_Diagnosis_loc <- new_col
+
+## Diagnosis column
+db.all$Diagnosis <- tstrsplit(db.all$Paper_ID_Diagnosis_loc,"_")[[2]]
+
+
+```
+
+
+### f. Add CD4/CD8 annotation
+
+#### --simple CD4/CD8 Annotations
+```{r}
+mab_table_cd4 <- mab_table[mab_table$seurat_converted_cell_barcode %in% colnames(pairs_cd4),]
+mab_table_cd8 <- mab_table[mab_table$seurat_converted_cell_barcode %in% colnames(pairs_cd8),]
+
+new_annot_col<- rep("No Annot",length(db.all$igseq_barcode))
+names(new_annot_col) <- db.all$igseq_barcode
+new_annot_col[names(new_annot_col) %in% as.character(unique(mab_table_cd4$igseq_barcode))] <- "CD4 T cells"
+new_annot_col[names(new_annot_col) %in% as.character(unique(mab_table_cd8$igseq_barcode))] <- "CD8 T cells"
+
+db.all$tcell_simple_annot <- new_annot_col
+```
+
+
+### g. Add simple Diagnosis Column
+```{r}
+simple_diagnosis_vec <- db.all$Diagnosis
+# MS
+simple_diagnosis_vec[simple_diagnosis_vec %in% c("RRMS","CIS")] <- "MS"
+# OND
+simple_diagnosis_vec[simple_diagnosis_vec %in% c("Neurosarcoidosis","NMO","Uveitis")] <- "OND"
+
+db.all$Diagnosis_simple <- simple_diagnosis_vec
+
+```
+
+### g. subset MS, HC, OND
+```{r}
+db_ms   <- db.all[db.all$Diagnosis %in% c("RRMS","CIS"),]
+db_hc   <- db.all[db.all$Diagnosis %in% c("HC"),]
+db_ond  <- db.all[db.all$Diagnosis %in% c("Neurosarcoidosis","NMO","Uveitis"),] 
+```
+
+### h. subset PB and CSF
+```{r}
+# Everything
+db.all.csf <- db.all[db.all$LOC == "CSF",]
+db.all.pb  <- db.all[db.all$LOC == "PB",]
+
+# MS
+db_ms_csf <- db_ms[db_ms$LOC == "CSF",]
+db_ms_pb  <- db_ms[db_ms$LOC == "PB",]
+
+# HC
+db_hc_csf <- db_hc[db_hc$LOC == "CSF",]
+db_hc_pb  <- db_hc[db_hc$LOC == "PB",]
+
+# OND
+db_ond_csf <- db_ond[db_ond$LOC == "CSF",]
+db_ond_pb  <- db_ond[db_ond$LOC == "PB",]
+```
+
+
+# ----------------------
+
+
+# UMAPs CSF Only
+
+* UMAP
+  * CSF high exp = pct_CSF > 0.75
+  * CSF moderate = CSF cell count > 1 & pct_CSF < 0.75
+  * CSF non-expanded = CSF cell count = 1 (PB ignored)
+* DGE (CSF only) - high expanded vs Non-expanded (all diagnosic categories)
+  * CSF high exp = pct_CSF > 0.75
+  * CSF non-expanded = CSF cell count = 1 (PB ignored)
+
+# 1. load Clonotype counts
+```{r}
+clonotype_counts_fh <- "./tables/patient_clonotype_pcts/ALL_PATIENTS_clonotype_counts.csv"
+
+clonotype_counts <- read.csv(clonotype_counts_fh,row.names = 1)
+
+# Add column of CSF expanded/Other
+HIGH_THRESH         = 0.75
+
+csf_high <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH,]
+csf_high_clonotypes <- row.names(csf_high)
+
+csf_mod_exp <- clonotype_counts[clonotype_counts$pct_CSF < HIGH_THRESH & clonotype_counts$CSF_count > 1,]
+csf_mod_exp_clonotypes <- row.names(csf_mod_exp)
+
+exp_category <- row.names(clonotype_counts)
+exp_category[exp_category %in% csf_high_clonotypes]    <- "CSF_high_expanded"
+exp_category[exp_category %in% csf_mod_exp_clonotypes] <- "CSF_mod_expanded"
+exp_category[! exp_category %in% c("CSF_high_expanded","CSF_mod_expanded")] <- "CSF_non_expanded"
+clonotype_counts$exp_category <- exp_category
+
+# Omit entries where CSF count = 0
+clonotype_counts <- clonotype_counts[clonotype_counts$CSF_count > 0,]
+
+
+ggplot(clonotype_counts, aes(x=pct_PB, y=pct_CSF,color=exp_category)) + geom_point(aes(size=cell_count)) + scale_color_manual(breaks = c("CSF_high_expanded", "CSF_mod_expanded","CSF_non_expanded"),values=c("red", "black","grey"))
+```
+
+# 2. DGE CSF unique high vs CSF high clonotypes
+
+### a. subset pairs_csfpb5_tcr
+```{r}
+clone_df_high   <- clonotype_counts[clonotype_counts$exp_category %in% "CSF_high_expanded",]
+clone_df_exp    <- clonotype_counts[clonotype_counts$exp_category %in% "CSF_mod_expanded",]
+clone_df_nonexp <- clonotype_counts[clonotype_counts$exp_category %in% "CSF_non_expanded",]
+
+target_clones  <- unique(row.names(clone_df_high))
+csf_exp_clones <- unique(row.names(clone_df_exp))
+csf_nonexp_clones <- unique(row.names(clone_df_nonexp))
+
+# Subset by CSF and Clonotypes with at least 1 CSF cell
+pairs_csfpb5_tcr_csf <- pairs_csfpb5_tcr[,names(pairs_csfpb5_tcr$loc[pairs_csfpb5_tcr$loc %in% c("CSF")])]
+pairs_csfpb5_tcr_csf <- pairs_csfpb5_tcr_csf[,names(pairs_csfpb5_tcr_csf$MERGED_clonotypeID_imm[pairs_csfpb5_tcr_csf$MERGED_clonotypeID_imm %in% c(target_clones,csf_exp_clones,csf_nonexp_clones)])]
+
+
+# Create column for annotations
+pairs_csfpb5_tcr_csf$CSF_high_annot <- pairs_csfpb5_tcr_csf$MERGED_clonotypeID_imm
+pairs_csfpb5_tcr_csf$CSF_high_annot[pairs_csfpb5_tcr_csf$CSF_high_annot %in% target_clones] <- "CSF_high_exp"
+pairs_csfpb5_tcr_csf$CSF_high_annot[pairs_csfpb5_tcr_csf$CSF_high_annot %in% csf_exp_clones] <- "CSF_mod_exp"
+pairs_csfpb5_tcr_csf$CSF_high_annot[!pairs_csfpb5_tcr_csf$CSF_high_annot %in% c("CSF_high_exp","CSF_mod_exp")] <- "Non_expanded"
+```
+
+# 3. UMAP
+
+### a. all CSF
+```{r,fig.width=8,fig.height=6}
+p1 <- dittoDimPlot(pairs_csfpb5_tcr_csf,var = "seurat_clusters",size = 1.0,opacity = 1.0,do.label = T,legend.show = T,main = NULL,do.raster = T,raster.dpi = 300)
+
+
+pdf(file = paste(plot_dir,"fig2a_umap_allCSF_clusters.pdf"),height = 6,width = 8)
+print(p1)
+dev.off()
+```
+
+
+### c. all CSF - colored by expansion category (CHANGE ORDER)
+
+```{r,fig.width=8,fig.height=6}
+# colored by exp category - bring CSF_high_exp to the top layer
+csf_exp_cols = c("CSF_mod_exp" = "grey","Non_expanded" = "grey","CSF_high_exp" = "red")
+
+# Change levels - so far doesn't work
+annot_order  <- c("CSF_high_exp","CSF_mod_exp","Non_expanded")
+annot_order2 <- c("Non_expanded","CSF_mod_exp","CSF_high_exp")
+#Idents(pairs_csfpb5_tcr_csf) <- pairs_csfpb5_tcr_csf$CSF_high_annot
+#levels(pairs_csfpb5_tcr_csf)                <- annot_order2
+levels(pairs_csfpb5_tcr_csf$CSF_high_annot) <- annot_order2
+
+p2 <- dittoDimPlot(pairs_csfpb5_tcr_csf,var = "CSF_high_annot",size = 2.0,opacity = 0.5,do.label = F,color.panel = csf_exp_cols,legend.show = T, main = NULL,do.raster = T,raster.dpi = 300)
+
+pdf(file = paste(plot_dir,"fig2a_umap_allCSF_exp_category.pdf"),height = 6,width = 8)
+print(p2)
+dev.off()
+```
+
+### d. clusters split by expansion
+```{r,fig.width=8,fig.height=6}
+p <- dittoDimPlot(pairs_csfpb5_tcr_csf,var = "seurat_clusters",size = 1.0,opacity = 1.0,do.label = F,legend.show = T,main = NULL,do.raster = T,raster.dpi = 300,split.by = "CSF_high_annot")
+
+
+pdf(file = paste(plot_dir,"fig2a_umap_CSFexp_clusters.pdf"),height = 6,width = 8)
+print(p)
+dev.off()
+```
+
+
+# 4. DGE top genes per cluster CSF
+```{r}
+getTopDGE <- function(clus,seurat.obj,fc_thresh = 0.1) {
+  # Get cluster vs cells from all remaining clusters
+  cells_cluster   <- names(seurat.obj$seurat_clusters[seurat.obj$seurat_clusters %in% clus])
+  cells_remaining <- names(seurat.obj$seurat_clusters[! seurat.obj$seurat_clusters %in% clus])
+  
+  # DGE cluster vs remaining cells
+  dge_clus <- FindMarkers(seurat.obj,ident.1 = cells_cluster,ident.2 =cells_remaining,logfc.threshold = fc_thresh)
+  
+  # Filter final cluster DGE table
+  dge_clus$cluster <- clus
+  dge_clus$gene    <- row.names(dge_clus)
+  dge_clus_sig     <- dge_clus[dge_clus$p_val_adj < 0.05,]
+  
+  return(dge_clus_sig)
+}
+
+uni_clusters <- unique(pairs_csfpb5_tcr_csf$seurat_clusters) %>% as.character()
+
+dge_results_list <- lapply(as.list(uni_clusters), getTopDGE,seurat.obj=pairs_csfpb5_tcr_csf,fc_thresh=0.1)
+
+dge_table_csf_clusters <- do.call("rbind",dge_results_list)
+
+# Get top genes per cluster
+TOP_N <- 50
+dge_table_csf_clusters_top <- dge_table_csf_clusters %>% group_by(cluster) %>% top_n(TOP_N, avg_log2FC)
+
+# Write CSV
+write.csv(as.data.frame(dge_table_csf_clusters_top),file = paste0(plot_dir,"tables/DGE_top_genes_per_cluster_TCR_CSF_fig2.csv"),quote = F,row.names = F)
+```
+
+
+# ----------------------
+
+
+# DGE CSF Only
+
+* DGE (CSF only) - high expanded vs Non-expanded
+  * CSF high exp = pct_CSF > 0.75
+  * (EXCLUDE) CSF moderate = CSF cell count > 1 & pct_CSF < 0.75
+  * CSF non-expanded = CSF cell count = 1 (PB ignored)
+
+# 1. load Clonotype counts
+
+
+# --FUNCTIONS
+```{r}
+plotDGEviolin <- function(results_dge, YLIM = c(-10,300)) {
+  p <- ggplot(results_dge) +
+    geom_point(aes(x=avg_log2FC, y=p_val_adj_log10, colour=sig_genes)) +
+    scale_color_manual(values=c("black", "red")) + 
+    ggtitle("Mov10 overexpression") +
+    xlab("log2 fold change") + 
+    ylab("-log10 adjusted p-value") +
+    theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) +
+    scale_y_continuous(limits = YLIM) +
+    scale_x_continuous(limits = c(-1.2,1.2))
+  
+  return(p)
+}
+```
+
+
+# 1. Load clone counts
+```{r}
+clonotype_counts_fh <- "./tables/patient_clonotype_pcts/ALL_PATIENTS_clonotype_counts.csv"
+
+clonotype_counts <- read.csv(clonotype_counts_fh,row.names = 1)
+
+# Add column of CSF expanded/Other
+HIGH_THRESH         = 0.75
+#CSF_PB_RATIO_THRESH = 2
+
+csf_high <- clonotype_counts[clonotype_counts$pct_CSF > HIGH_THRESH,]
+csf_high_clonotypes <- row.names(csf_high)
+
+csf_mod_exp <- clonotype_counts[clonotype_counts$pct_CSF < HIGH_THRESH & clonotype_counts$CSF_count > 1,]
+csf_mod_exp_clonotypes <- row.names(csf_mod_exp)
+
+exp_category <- row.names(clonotype_counts)
+exp_category[exp_category %in% csf_high_clonotypes]    <- "CSF_high_expanded"
+exp_category[exp_category %in% csf_mod_exp_clonotypes] <- "CSF_mod_expanded"
+exp_category[! exp_category %in% c("CSF_high_expanded","CSF_mod_expanded")] <- "CSF_non_expanded"
+clonotype_counts$exp_category <- exp_category
+
+# Omit entries where CSF count = 0
+clonotype_counts <- clonotype_counts[clonotype_counts$CSF_count > 0,]
+clonotype_counts <- clonotype_counts[clonotype_counts$exp_category %in% c("CSF_high_expanded", "CSF_non_expanded"),]
+
+ggplot(clonotype_counts, aes(x=pct_PB, y=pct_CSF,color=exp_category)) + geom_point(aes(size=cell_count)) + scale_color_manual(breaks = c("CSF_high_expanded","CSF_non_expanded"),values=c("red", "black"))
+```
+
+
+# 2. CSF High exp vs Non-Expanded
+
+### a. run DGE
+
+```{r}
+pairs_csfpb5_tcr_csf_sub <- pairs_csfpb5_tcr_csf[,names(pairs_csfpb5_tcr_csf$CSF_high_annot[pairs_csfpb5_tcr_csf$CSF_high_annot %in% c("CSF_high_exp","Non_expanded")])]
+
+cells_high <- names(pairs_csfpb5_tcr_csf$CSF_high_annot[pairs_csfpb5_tcr_csf$CSF_high_annot %in% "CSF_high_exp"])
+cells_nonexp <- names(pairs_csfpb5_tcr_csf$CSF_high_annot[pairs_csfpb5_tcr_csf$CSF_high_annot %in% "Non_expanded"])
+
+
+dge_csf_high_vs_nonexp1 <- FindMarkers(pairs_csfpb5_tcr_csf_sub,ident.1 = cells_high,ident.2 =cells_nonexp,logfc.threshold = 0.0,)
+dge_csf_high_vs_nonexp2 <- FindMarkers(pairs_csfpb5_tcr_csf_sub,ident.1 = cells_nonexp,ident.2 =cells_high,logfc.threshold = 0.0,)
+dge_csf_high_vs_nonexp1$cluster <- "CSF_high_exp"
+dge_csf_high_vs_nonexp2$cluster <- "Non_expanded"
+dge_csf_high_vs_nonexp1$gene    <- row.names(dge_csf_high_vs_nonexp1)
+dge_csf_high_vs_nonexp2$gene    <- row.names(dge_csf_high_vs_nonexp2)
+dge_csf_high_vs_nonexp          <- rbind(dge_csf_high_vs_nonexp1,dge_csf_high_vs_nonexp2)
+
+dge_csf_high_vs_nonexp_sig <- dge_csf_high_vs_nonexp[dge_csf_high_vs_nonexp$p_val_adj < 0.05,]
+```
+
+
+### b. sample Volcano
+```{r,fig.height=6,fig.width=6}
+results_dge <- dge_csf_high_vs_nonexp
+sig_genes <- results_dge$p_val_adj
+sig_genes[sig_genes < 0.05] <- "Significant"
+sig_genes[! sig_genes %in% "Significant"] <- "Not Significant"
+results_dge$sig_genes <- sig_genes
+
+results_dge$p_val_adj_log10 <- -log10(results_dge$p_val_adj)
+results_dge$p_val_adj_log10[results_dge$p_val_adj_log10 == Inf] <- -10
+
+# Label genes above 50 on Y-axis
+results_dge      <- results_dge[results_dge$cluster %in% "CSF_high_exp",]
+volcano_csf_high <- plotDGEviolin(results_dge,YLIM = c(0,200))
+
+### PDF
+pdf(file = paste(plot_dir,"fig2_volcano_CSF_HighVsNonexp.pdf"),height = 6,width = 6)
+volcano_csf_high
+dev.off()
+
+### CSV 
+write.csv(results_dge, file = paste(plot_dir,"fig2_volcano_CSF_HighVsNonexp.csv",sep = ""),quote = F,row.names = F)
+```
+
+
+# 3. CSF High exp - MS vs. Non-MS
+
+### a. DGE
+```{r}
+pairs_csfpb5_tcr_csf_high_exp <- pairs_csfpb5_tcr_csf[,names(pairs_csfpb5_tcr_csf$CSF_high_annot[pairs_csfpb5_tcr_csf$CSF_high_annot %in% c("CSF_high_exp")])]
+
+ms_status <- pairs_csfpb5_tcr_csf_high_exp$Diagnostic_Category
+ms_status[ms_status %in% c("HC","OND")] <- "Non-MS"
+pairs_csfpb5_tcr_csf_high_exp$MS_status <- ms_status
+
+cells_ms <- names(pairs_csfpb5_tcr_csf_high_exp$MS_status[pairs_csfpb5_tcr_csf_high_exp$MS_status %in% "MS"])
+cells_nonms <- names(pairs_csfpb5_tcr_csf_high_exp$MS_status[pairs_csfpb5_tcr_csf_high_exp$MS_status %in% "Non-MS"])
+
+dge_csf_high_ms_vs_nonms1 <- FindMarkers(pairs_csfpb5_tcr_csf_high_exp,ident.1 = cells_ms,ident.2 =cells_nonms,logfc.threshold = 0.0,)
+dge_csf_high_ms_vs_nonms2 <- FindMarkers(pairs_csfpb5_tcr_csf_high_exp,ident.1 = cells_nonms,ident.2 =cells_ms,logfc.threshold = 0.0,)
+dge_csf_high_ms_vs_nonms1$cluster <- "MS"
+dge_csf_high_ms_vs_nonms2$cluster <- "Non-MS"
+dge_csf_high_ms_vs_nonms1$gene    <- row.names(dge_csf_high_ms_vs_nonms1)
+dge_csf_high_ms_vs_nonms2$gene    <- row.names(dge_csf_high_ms_vs_nonms2)
+dge_csf_high_ms_vs_nonms          <- rbind(dge_csf_high_ms_vs_nonms1,dge_csf_high_ms_vs_nonms2)
+```
+
+
+
+### b. Heatmaps/volcano
+```{r}
+results_dge <- dge_csf_high_ms_vs_nonms
+sig_genes <- results_dge$p_val_adj
+sig_genes[sig_genes < 0.05] <- "Significant"
+sig_genes[! sig_genes %in% "Significant"] <- "Not Significant"
+results_dge$sig_genes <- sig_genes
+
+results_dge$p_val_adj_log10 <- -log10(results_dge$p_val_adj)
+results_dge$p_val_adj_log10[results_dge$p_val_adj_log10 == Inf] <- -10
+
+volcano_csf_high_ms_status <- plotDGEviolin(results_dge,YLIM = c(0,10))
+```
+
+
+# 4. Targeted Gene Panel
+
+```{r}
+target_gene_panel_df <- read.csv("./tables/TCR_genes_of_interest.csv",stringsAsFactors = F)
+```
+
+### a. Heatmaps
+```{r}
+DoHeatmap(object = pairs_csfpb5_tcr_csf_high_exp,features = target_gene_panel_df$Gene, draw.lines = T,group.by = "CSF_high_annot")
+```
+
+### b. Dot plot
+
+#### --PDF
+```{r,fig.height=7,fig.width=5}
+dge_csf_high_vs_nonexp_sig_target <- dge_csf_high_vs_nonexp_sig[dge_csf_high_vs_nonexp_sig$gene %in% target_gene_panel_df$Gene,]
+
+dge_csv_high_vs_nonexp_fh  <- paste(plot_dir,"fig2_DGE_DotPlot_target_panel_CSFexp_vs_NonExp.csv",sep = "")
+write.csv(dge_csf_high_vs_nonexp_sig,file = dge_csv_high_vs_nonexp_fh,quote = F)
+
+
+pdf(file = paste(plot_dir,"fig2_DotPlot_target_panel_CSFexp_vs_NonExp.pdf",sep = ""),height = 7,width = 5)
+DotPlot(pairs_csfpb5_tcr_csf_sub,features = rev(target_gene_panel_df$Gene),group.by = "CSF_high_annot") + theme(axis.text.x = element_text(angle = 90, hjust=1)) + coord_flip()
+dev.off()
+```
+
