@@ -1,0 +1,326 @@
+---
+title: "Fig 3 Igraph GLIPH2 network"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(stringr)
+library(alakazam)
+library(shazam)
+library(tigger)
+library(dowser)
+library(dplyr)
+library(igraph)
+library(cowplot)
+
+working_dir <- "./sc_analysis/"
+setwd(working_dir)
+
+fh <- "./gliph_results/CSF_High_ClonotypeNetwork_GLIPH2/gliph_cleaned_clusters_CSF_high_GLIPH2.csv"
+
+# filtered network from Cytoscape
+#  - only use clones in this table, filter the CSF high GLIPH2 results
+fh2 <- "./gliph_results/GLIPH_cytoscape.csv"
+
+# Meta data 10X - convert to Paper IDs
+metadata_fh <- "./metadata/metadata.csv"
+
+plot_dir      <- "./plots_main/"
+```
+
+
+# --FUNCTIONS
+```{r}
+# Function for formatting columns
+createNodeCol <- function(clone_col, conv_list) {
+  uni_clones <- unique(clone_col)
+  for (clone in uni_clones) {
+    clone <- as.character(clone)
+    categ <- conv_list[[clone]]
+    clone_col[clone_col %in% clone] <- categ
+  }
+  
+  return(clone_col)
+}
+
+# getAllUniPairwiseInteractions
+#  - list all pairwise clonotype interactions for edge dataframe
+getAllUniPairwiseInteractions <- function(pt_nodes,clone) {
+  clone_df  <- pt_nodes[pt_nodes$clone_id %in% clone,]
+  node_list <- clone_df$id
+  list_len  <- length(node_list)
+  
+  all_uni_pairs <- c()
+  for (i in 1:(list_len-1)) {
+    curr_node <- node_list[i]
+    rem_nodes <- node_list[(i+1):list_len]
+    pairs     <- paste(curr_node,rem_nodes,sep = ":interac:")
+    all_uni_pairs <- c(all_uni_pairs,pairs)
+  }
+  
+  all_uni_pairs <- unique(all_uni_pairs)
+  
+  return(all_uni_pairs)
+}
+
+# createPatientNodeDataframe 
+#  - take full immcantation results for mAb paper and subset one patient
+#  - only keep columns that are needed
+#  - at this stage imm_results has already been formatted to have 'mab_names' for the paper
+#  - format node df for igraph based on subset of imm_results, connections based on clonotype ID
+createPatientNodeDataframe <- function(imm_results,target_pt,EXPANSION_THRESH = 1,include_mabs = F,
+                                    COLS_TO_KEEP = c("sequence_id","patient","clone_id","junction_aa","umi_count","consensus_count","mab_name")) {
+  ### 1. subset immcantation results
+  imm_results_pt <- imm_results[imm_results$patient %in% target_pt,]
+  imm_results_pt <- imm_results_pt[,COLS_TO_KEEP]
+  
+  ### 2. Create clone count table
+  clone_count_table            <- as.data.frame(table(imm_results_pt$clone_id))
+  names(clone_count_table)     <- c("clone_id","count")
+  clone_count_table$count      <- as.numeric(clone_count_table$count)
+  clone_count_table$clone_id   <- as.character(clone_count_table$clone_id)
+  clone_count_table$exp_status <- clone_count_table$count
+  clone_count_table$exp_status[clone_count_table$exp_status > EXPANSION_THRESH] <- "Expanded"
+  clone_count_table$exp_status[! clone_count_table$exp_status %in% "Expanded"] <- "Non_Expanded"
+  
+  clone_count_table$clone_id_fmt <- paste("clone",clone_count_table$clone_id,sep = "")
+  
+  ### 3. initialize Node df
+  nseqs <- nrow(imm_results_pt)
+  
+  pt_nodes <- data.frame(matrix(nrow = nseqs,ncol = 5))
+  names(pt_nodes) <- c("id","clone_id","clone_type","clone_type_label","clone_size")
+  pt_nodes$id <- imm_results_pt$sequence_id
+  pt_nodes$clone_id <- imm_results_pt$clone_id
+  pt_nodes$clone_id <- paste("clone",pt_nodes$clone_id,sep = "")
+  
+  
+  ### 4. Add extra info to node df (expansion status, clone count, etc.)
+  
+  # Conversion lists from clone table
+  clone_status_list        <- clone_count_table$exp_status
+  names(clone_status_list) <- clone_count_table$clone_id_fmt
+  
+  clone_status_num_list    <- clone_status_list
+  clone_status_num_list[clone_status_num_list %in% "Expanded"]     <- 2
+  clone_status_num_list[clone_status_num_list %in% "Non_Expanded"] <- 1
+  
+  clone_count_list        <- as.character(clone_count_table$count)
+  names(clone_count_list) <- clone_count_table$clone_id_fmt
+  
+  clone_status_list        <- as.list(clone_status_list)
+  clone_status_num_list    <- as.list(clone_status_num_list)
+  clone_count_list         <- as.list(clone_count_list)
+  
+  # Clonotype labels and size columns
+  pt_nodes$clone_type_label <- createNodeCol(pt_nodes$clone_id,clone_status_list)
+  pt_nodes$clone_type       <- createNodeCol(pt_nodes$clone_id,clone_status_num_list)
+  pt_nodes$clone_size       <- createNodeCol(pt_nodes$clone_id,clone_count_list)
+  
+  # Adjust clone label based on mAb presence
+  if(include_mabs){
+    pt_nodes$mab_name <- ""
+    
+    imm_results_mabs  <- imm_results_pt[! imm_results_pt$mab_name %in% "",]
+    if(nrow(imm_results_mabs) > 0){
+      mab_seq_ids    <- imm_results_mabs$sequence_id
+      pt_nodes_mabs  <- pt_nodes[pt_nodes$id %in% mab_seq_ids,]
+      # Update type
+      updated_clone_type <- pt_nodes_mabs$clone_type_label
+      updated_clone_type[updated_clone_type %in% "Expanded"]     <- "4"
+      updated_clone_type[updated_clone_type %in% "Non_Expanded"] <- "3"
+      pt_nodes_mabs$clone_type <- updated_clone_type
+      
+      # Update clone type label
+      pt_nodes_mabs$clone_type_label <- paste("mAb",pt_nodes_mabs$clone_type_label, sep = "_")
+      
+      # Add in mAb names
+      mab_name_vec        <- imm_results_mabs$mab_name
+      names(mab_name_vec) <- mab_seq_ids
+      col_mabs            <- pt_nodes_mabs$id
+      for (i in 1:length(col_mabs)) {
+        cell <- col_mabs[i]
+        mab  <- as.character(mab_name_vec[names(mab_name_vec) %in% cell])
+        col_mabs[i] <- mab
+      }
+      # only add in mAb name for the paper - exclude the patient number
+      col_mabs <- tstrsplit(col_mabs,"_")[[1]]
+      for (i in 1:length(col_mabs)) {
+        mab_label <- col_mabs[i]
+        if(grepl("\\.",mab_label)){mab_label <- tstrsplit(mab_label,"\\.")[[2]]}
+        col_mabs[i] <- mab_label
+      }
+      pt_nodes_mabs$mab_name <- col_mabs
+      
+      # Intert updates back into original node df
+      pt_nodes[row.names(pt_nodes_mabs),] <- pt_nodes_mabs
+    }
+    
+  }
+  
+  return(pt_nodes)
+}
+
+
+# createPatientNodeDataframe
+#  - take input patient node dataframe and create corresponding links/edge df
+#  - each edge interactions is a clonal connection
+createPatientEdgeDataframe <- function(node_df,default_interac_type = "hyperlink",
+                                       EDGE_COLS = c("from","to","type","weight")) {
+  # Initialize edge df
+  pt_links <- data.frame(matrix(nrow = 0,ncol = 4))
+  names(pt_links) <- EDGE_COLS
+  
+  # create clone count list
+  clone_count_list <- list()
+  clone_count_vec <- unique(paste(node_df$id,node_df$clone_size,sep = ":"))
+  for (id_count in clone_count_vec) {
+    info_vec <- unlist(str_split(id_count,":"))
+    clone_count_list[[info_vec[1]]] <- as.numeric(info_vec[2])
+  }
+  
+  # Only make connections for Expanded clones
+  for (gliph_grp in unique(node_df$clone_id)) {
+      clone_interacs <- getAllUniPairwiseInteractions(node_df,gliph_grp)
+      
+      # Create entry for all clone interactions
+      clone_links <- data.frame(matrix(nrow = length(clone_interacs),ncol = 4))
+      names(clone_links) <- EDGE_COLS
+      clone_links$from <- tstrsplit(clone_interacs,":interac:")[[1]]
+      clone_links$to <- tstrsplit(clone_interacs,":interac:")[[2]]
+      
+      clone_links$type   <- default_interac_type
+      #clone_links$weight <- clone_count_list[[clone]]
+      clone_links$weight <- 1
+      
+      # rbind
+      pt_links <- rbind(pt_links,clone_links)
+  }
+  pt_links$edge_arrows <- 0
+
+  return(pt_links)
+}
+```
+
+
+
+
+# 1. Load CSF Table
+* CSF High clonotype results GLIPH2
+* Nodes = clonotype ID
+* edges = gliph group
+* node label = clonotype ID
+* node color = Paper ID
+* make table of node info (node ID, edge/gliph group, etc.)
+
+### a. load
+```{r}
+gliph_results <- read.csv(fh,stringsAsFactors = F)
+gliph_results_sub <- read.csv(fh2, stringsAsFactors = F)
+metadata      <- read.csv(metadata_fh,stringsAsFactors = F)
+
+# Paper ID conversion list
+conv_vec <- unique(metadata$Paper_ID)
+names(conv_vec) <- unique(metadata$Patient_ID)
+paperid_conv_list <- as.list(conv_vec)
+```
+
+### b. update gliph group assignment 
+* clonotypes that have multiple gliph groups need to be renamed
+```{r}
+gliph_group_col <- gliph_results$gliph_group
+multi_groups    <- unique(gliph_group_col[grep(":",gliph_group_col)])
+for (grp in multi_groups) {
+  indiv_grps <- unlist(strsplit(grp,":"))
+  gliph_group_col[gliph_group_col %in% c(grp,indiv_grps)] <- grp
+}
+
+gliph_results$gliph_group <- gliph_group_col
+```
+
+# 2. generate gliph network
+```{r}
+# Create Network (done in a loop for all patients)
+pt_nodes <- data.frame(matrix(nrow = nrow(gliph_results),ncol = 5))
+names(pt_nodes) <- c("id","clone_id","clone_type","clone_type_label","clone_size")
+pt_nodes$id <- gliph_results$Node_ID
+pt_nodes$clone_id <- gliph_results$gliph_group
+pt_nodes$clone_type_label <- gliph_results$Paper_ID_Diagnosis_loc
+pt_nodes$clone_type       <- as.numeric(tstrsplit(gliph_results$Paper_ID_Diagnosis_loc,"_")[[1]])
+pt_nodes$clone_size       <- (gliph_results$clonotype_CSF_freq * 3) + 1
+
+# add Disease column 
+pt_nodes$diagnosis <- tstrsplit(pt_nodes$clone_type_label,"_")[[2]]
+pt_nodes$diagnosis[pt_nodes$diagnosis %in% c("RRMS","CIS")] <- "MS"
+
+pt_edges <- createPatientEdgeDataframe(pt_nodes)
+pt_edges <- pt_edges[! pt_edges$to %in% c("","NA",NA),]
+pt_edges <- pt_edges[! pt_edges$from %in% c("","NA",NA),]
+
+net      <- graph_from_data_frame(d=pt_edges, vertices=pt_nodes, directed=F)
+```
+
+
+
+
+# 3. Format node/edge looks for this network
+* Change node color, size, etc.
+* Color by disease status
+* label by Patient ID (clone_type)
+```{r}
+# formatIgraphNetBCR
+#  - format networks for node and edge features so everything is consistent
+formatIgraphNetGLIPH <- function(net) {
+  # Generate colors based on media type:
+  color_vec <- V(net)$diagnosis   # Disease status
+  color_vec[color_vec %in% "MS"]               <- "tomato"
+  color_vec[color_vec %in% "HC"]               <- "gray80"
+  color_vec[color_vec %in% "Neurosarcoidosis"] <- "blue"
+  
+  V(net)$color <- color_vec
+  
+  # Set node size based on audience size:
+  size_vec <- as.numeric(V(net)$clone_size) + 8
+  V(net)$size <- size_vec
+
+  # The labels are currently node IDs.
+  
+  # Setting them to NA will render no labels:
+  V(net)$label <- V(net)$clone_type  # Possibly label by Patient ID
+
+  #change arrow size and edge color:
+  E(net)$arrow.mode <- 0
+  E(net)$edge.color <- "black"
+  E(net)$width      <- 1
+  
+  return(net)
+}
+
+# Format network
+net <- formatIgraphNetGLIPH(net)
+```
+
+
+# 4. Plot network
+```{r,fig.height=5,fig.width=6}
+plot_title <- "GLIPH2 CSF High Network"
+fig3_gliph_net <- plot(net,layout = layout_nicely, main = plot_title)
+
+
+```
+
+## --PDF
+```{r}
+output_file <- file.path(plot_dir,"fig3_gliph_CSFhigh_network.pdf")
+pdf(output_file,height = 5,width = 6)
+plot(net,layout = layout_nicely, main = plot_title)
+dev.off()
+```
